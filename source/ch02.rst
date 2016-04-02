@@ -1,0 +1,1849 @@
+Chapter 2: Designing the Scene Graph
+====================================
+
+在本章中，我们将会讨论：
+
+-  使用智能观察者指针
+-  共享与克隆对象
+-  计算节点的世界边界盒子
+-  创建一个运动的汽车
+-  镜像场景图
+-  设计宽度优先节点访问器
+-  实现背景图节点
+-  使得我们的节点总是面向屏幕
+-  使用绘制回调来执行NVIDA Cg函数
+-  实现指南针节点
+
+Introduction
+------------
+
+在本章中我们将会展示一系列关于配置场景图以及使用简单有效的方法实现某些特殊效果的有趣主题
+。我们假定我们已经了解了组合节点，叶子节点（geode），父接口与子接口的概念。如果还没有，我们可以首先阅读OpenSceneGraph
+3.0: Beginner's
+Guide。下列原则的主要目的是以一种灵活的方式使用节点与回调。
+
+在我们开始之前，准备一些常用的函数与类以备应用是很有必要的。这些实用程序可以被用来快速创建节点，事件处理器，以及其他的场景对象。因为我们刚刚开始本书，我们将会了解一些真实的编程案例；在“常用”的领域只有三个组件。第一个是createHUDCamera()函数：
+
+::
+
+    osg::Camera* createHUDCamera( double left, double right, double 
+    bottom, double top )
+    {
+      osg::ref_ptr<osg::Camera> camera = new osg::Camera;
+      camera->setReferenceFrame( osg::Transform::ABSOLUTE_RF );
+      camera->setClearMask( GL_DEPTH_BUFFER_BIT );
+      camera->setRenderOrder( osg::Camera::POST_RENDER );
+      camera->setAllowEventFocus( false );
+      camera->setProjectionMatrix(
+        osg::Matrix::ortho2D(left, right, bottom, top) );
+      camera->getOrCreateStateSet()->setMode(
+        GL_LIGHTING, osg::StateAttribute::OFF );
+      return camera.release();
+    }
+
+这个函数将会创建一个在主场景绘制之后在顶部被渲染的普通相机节点。他可以被用来显示一些heads-up
+display(HUD)文本与图像。我们可以访问下面的链接来了解更多关于HUD的概念：http://en.wikipedia.org/wiki/HUD\_(video\_gaming)。
+
+而且拥有一个用来创建HUD文本的函数是很必要的。其内容显示在下面的代码块中：
+
+::
+
+    osg::ref_ptr<osgText::Font> g_font = osgText::readFontFile("fonts/ 
+      arial.ttf");
+    osgText::Text* createText( const osg::Vec3& pos, const std::string&  
+      content, float size )
+    { 
+      osg::ref_ptr<osgText::Text> text = new osgText::Text;
+      text->setDataVariance( osg::Object::DYNAMIC );
+      text->setFont( g_font.get() );
+      text->setCharacterSize( size );
+      text->setAxisAlignment( osgText::TextBase::XY_PLANE );
+      text->setPosition( pos );
+      text->setText( content );
+      return text.release();
+    }
+
+当然，他已经被设计来平滑处理HUD相机节点。
+
+最后一个要实现的有用工具是一个选取处理器，通过该处理器我们可以快速选择一个节点或是在屏幕上显示的可绘制元素，并且获取信息与父节点路径。他必须被派生以应用于实践：
+
+::
+
+    class PickHandler : public osgGA::GUIEventHandler
+    {
+    public:
+      // This virtual method must be overrode by subclasses.
+      virtual void doUserOperations(
+        osgUtil::LineSegmentIntersector::Intersection& ) = 0;
+        virtual bool handle( const osgGA::GUIEventAdapter& ea,
+          osgGA::GUIActionAdapter& aa )
+        {
+          if ( ea.getEventType()!=osgGA::GUIEventAdapter::RELEASE
+            ||ea.getButton()!=osgGA::GUIEventAdapter::LEFT_MOUSE_BUTTON
+            ||!(ea.getModKeyMask()&osgGA::GUIEventAdapter::MODKEY_CTRL) )
+          return false;
+          osgViewer::View* viewer = dynamic_cast<osgViewer::View*>(&aa);
+          if ( viewer )
+          {
+            osg::ref_ptr<osgUtil::LineSegmentIntersector>
+              intersector = new osgUtil::LineSegmentIntersector
+                (osgUtil::Intersector::WINDOW, ea.getX(), ea.getY());
+            osgUtil::IntersectionVisitor iv( intersector.get() );
+              viewer->getCamera()->accept( iv );
+              if ( intersector->containsIntersections() )
+                {
+                  osgUtil::LineSegmentIntersector::Intersection&
+                    result = *(intersector->getIntersections().begin());
+                  doUserOperations( result );
+                }
+          }
+          return false;
+        }
+    };    
+
+当我们在场景上点击来选取对象时，我们必须同时按下Ctrl以区分选择操作与普通的场景浏览。
+
+所有这三个小实用程序被放置在osgCookbook名字空间中以避免混肴问题。而且我们将会以统一的方式，例如osgCookbook::createText()，进行直接调用，假定我们已经将其放置在一个合适的位置。
+
+同时，我们可以浏览本章的源代码。
+
+Using smart and observer pointers
+---------------------------------
+
+我们应该已经熟悉了智能指针osg::ref\_ptr<>，该指针使用引用计数管理所有已分配的对象，并且在引用计数减少到0时将其销毁。在这种情况下，osg::ref\_ptr<>实际是一个实现了托管对象生命的强指针。
+
+然而我们将会遇到另一种类型的智能指针，弱指针。弱指针，也就是OSG核心库中的osg::observer\_ptr<>，并不会拥有对象，而且不会修改其引用计数值，而无论其被关联还是解关联。但是他有一个属性，当对象被删除或是重用时，他会得到通知并且自动设置为NULL来避免使用不正确的指针。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+在本节中将会创建一个交互程序来演示检测指针是否可用的osg::observer\_ptr<>模板类的主要特性。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/ShapeDrawable>
+    #include <osg/Geode>
+    #include <osgViewer/Viewer>
+
+2. 我们需要有一个由osgCookBook::PickHandler辅助类派生的RemoveShapeHandler类。他简单的检测并由其父节点中移除所选中的可绘制元素：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class RemoveShapeHandler : public osgCookBook::PickHandler
+    {
+      virtual void doUserOperations( osgUtil::LineSegmentIntersector::
+        Intersection& result )
+      {
+        if ( result.nodePath.size()>0 )
+        {
+          osg::Geode* geode = dynamic_cast<osg::Geode*>(
+            result.nodePath.back() );
+          if ( geode ) geode->removeDrawable(
+            result.drawable.get() );
+        }
+      }
+    };
+
+3. ObserveShapeCallback类在这里被用来使用osg::observer\_ptr<>模板类保存两个可绘制元素。作为一个弱指针，如果所引用的对象由于某种原因被回收，他会自动将指针设置为NULL。这里的成员\_text变量将会记录这些变化，并在屏幕上显示：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class ObserveShapeCallback : public osg::NodeCallback
+    {
+    public:
+      virtual void operator()( osg::Node* node, osg::NodeVisitor* nv )
+      {
+        std::string content;
+        if ( _drawable1.valid() ) content += "Drawable 1; ";
+        if ( _drawable2.valid() ) content += "Drawable 2; ";
+        if ( _text.valid() ) _text->setText( content );
+      }
+      osg::ref_ptr<osgText::Text> _text;
+      osg::observer_ptr<osg::Drawable> _drawable1;
+      osg::observer_ptr<osg::Drawable> _drawable2;
+    };
+
+4. 在主体部分中，我们首先构建场景图。他包含一个带有文本的HUD相机，以及两个在本实验中将会用到的基本可绘制元素：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    // Create the text and place it in an HUD camera
+    osgText::Text* text = osgCookBook::createText(osg::Vec3( 
+      50.0f, 50.0f, 0.0f), "", 10.0f);
+    osg::ref_ptr<osg::Geode> textGeode = new osg::Geode;
+    textGeode->addDrawable( text );
+    osg::ref_ptr<osg::Camera> hudCamera =  
+      osgCookBook::createHUDCamera(0, 800, 0, 600);
+    hudCamera->addChild( textGeode.get() );
+    // Create two simple shapes and add both, as well as the camera,  
+    // to the root node
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( new osg::ShapeDrawable(new  
+      osg::Box(osg::Vec3(-2.0f,0.0f,0.0f), 1.0f)) );
+    geode->addDrawable( new osg::ShapeDrawable(new osg::Sphere(osg::Ve 
+      c3(2.0f,0.0f,0.0f), 1.0f)) );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( hudCamera.get() );
+    root->addChild( geode.get() );
+
+5. 为根节点（或是场景中的其他节点创建更新回调），并使用下面的方法设置其公共成员变量：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<ObserveShapeCallback> observerCB =  
+      new ObserveShapeCallback;
+    observerCB->_text = text;
+    observerCB->_drawable1 = geode->getDrawable(0);
+    observerCB->_drawable2 = geode->getDrawable(1);
+    root->addUpdateCallback( observerCB.get() );
+
+6. 添加RemoveShapeHandler实例以与可绘制元素交互并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgViewer::Viewer viewer;
+    viewer.addEventHandler( new RemoveShapeHandler );
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+7. 按下Ctrl并在图形上点击来将其由场景图中删除，我们将会看到底部所显示的文本会立即发生变化。观察者指针已经发现该图形不再为其他的对象所引用，所以，该指针会重新设置其自身以避免悬挂指针问题。
+
+.. figure:: _images/osgcookbook_2.1.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+这里的RemoveShapeHandler重新实现了父类的doUserOperation()方法来检测图形是否被选中，并将其由父osg::Geode节点中解引用。因为没有其他的智能指针引用该图形，他实际上被由系统内存中删除。osg::observer\_ptr<>模板类，作为弱指针仅会观察到节点的分配与销毁，并且会自动将其数据切换为NULL来避免后续不正确的使用。
+
+如果我们将要观察或是使用回调或用户处理中的节点，而无需添加冗余的引用，则弱指针将会是很好的选择。在这里使用原生指针会非常麻烦，因为我们必须总是保证对象依然可用；否则，我们的程序会立即崩溃。
+
+在多线程程序中，使用lock()方法将弱指针转换为临时强指针是安全的，以避免其他线程中的同步对象删除。代码段如下：
+
+::
+
+    // Define a member variable using osg::observer_ptr<>.
+    osg::observer_ptr<osg::Node> _memberNode;
+    // In a thread, when we want to obtain the member node.
+    osg::ref_ptr<osg::Node> tempRefOfNode;
+    if ( _memberNode.lock(tempRefOfNode) )
+    {
+      osg::Node* realNode = tempRefOfNode.get();
+      // Do something to the realNode.
+      // Don't worry if it is unreferenced or deleted in
+      // other threads, because tempRefOfNode can ensure
+      // it works during the lifetime of the smart pointer.
+    }
+
+There's more...
+~~~~~~~~~~~~~~~
+
+我们可以参考Boost库并在下列站点阅读关于其shared\_ptr（强指针）与weak\_ptr实现的更多内容：
+
+http://www.boost.org/doc/libs/1_46_1/libs/smart_ptr/shared_ptr.htm
+
+http://www.boost.org/doc/libs/1_46_1/libs/smart_ptr/weak_ptr.htm
+
+MSDN站点也包含类似的类：
+
+http://msdn.microsoft.com/en-us/library/bb982026.aspx
+
+http://msdn.microsoft.com/en-us/library/bb982126.aspx
+
+Sharing and cloning objects
+---------------------------
+
+对于基于OSG的巨型3D程序，节点与可绘制元素的共享是重要的优化。但是有时，在前一个节点与新节点之间并没有任何共享内存块的重复节点对于处理用户数据同样非常有用。在本示例中，我们将会在一个交互程序中演示两种实现，并解释我们所有的场景图之间的主要区别。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+我们将会两次克隆一个简单的球形，每次使用不同的机制（浅拷贝或深拷贝）。用户可以按下Ctrl并点击球来改变其颜色。浅拷贝的球会同时发生变化，因为他们指向相同的内存地址，但是深拷贝的则不会。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/ShapeDrawable>
+    #include <osg/Geode>
+    #include <osg/MatrixTransform>
+    #include <osgViewer/Viewer>
+
+2. 这次我们希望选择任意的可绘制元素并在可能时改变其颜色。这里SetShapeColorHandler类将会为我们做这些工作。每次我们选择一个osg::ShapeDrawable对象时，其颜色将会反转。从而我们可以快速找到共享相同可绘制元素的所有节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class SetShapeColorHandler : public osgCookBook::PickHandler
+    {
+      virtual void doUserOperations( osgUtil::LineSegmentIntersector
+        ::Intersection& result )
+      {
+        osg::ShapeDrawable* shape = dynamic_cast<osg::ShapeDrawable*>
+          ( result.drawable.get() );
+        if ( shape ) shape->setColor( osg::Vec4(
+          1.0f, 1.0f, 1.0f, 2.0f) - shape->getColor() );
+      }
+    };
+
+3. 这里createMatrixTransform()函数仅在指定的位置创建一个变换节点，并添加一个osg::Geode作为其子节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Node* createMatrixTransform( osg::Geode* geode,
+      const osg::Vec3& pos )
+    {
+      osg::ref_ptr<osg::MatrixTransform> trans = 
+        new osg::MatrixTransform;
+      trans->setMatrix( osg::Matrix::translate(pos) );
+      trans->addChild( geode );
+      return trans.release();
+    }
+
+4. 在主体部分，创建一个基本的圆形，并禁止其上显示列表的使用。这是因为其颜色会在稍后的模拟循环中动态变化：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::ShapeDrawable> shape = new osg::ShapeDrawable(  
+      new osg::Sphere );
+    shape->setColor( osg::Vec4(1.0f, 1.0f, 0.0f, 1.0f) );
+    shape->setDataVariance( osg::Object::DYNAMIC );
+    shape->setUseDisplayList( false );
+
+5. 现在我们将演示不同的克隆类型。包含可变化圆形的原始geode1会被复制到geode2（浅拷贝）与geode3（深拷贝），并且所有三个节点会通过相应的变换被添加到根节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode1 = new osg::Geode;
+    geode1->addDrawable( shape.get() );
+    osg::ref_ptr<osg::Geode> geode2 = dynamic_cast<osg::Geode*>(
+      geode1->clone(osg::CopyOp::SHALLOW_COPY) );
+    osg::ref_ptr<osg::Geode> geode3 = dynamic_cast<osg::Geode*>(
+      geode1->clone(osg::CopyOp::DEEP_COPY_ALL) );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( createMatrixTransform(geode1.get(),
+      osg::Vec3(0.0f, 0.0f, 0.0f)) );
+    root->addChild( createMatrixTransform(geode2.get(),
+      osg::Vec3(-2.0f, 0.0f, 0.0f)) );
+    root->addChild( createMatrixTransform(geode3.get(),
+      osg::Vec3(2.0f, 0.0f, 0.0f)) );
+
+6. 在启动查看器之前，不要忘记添加处理器，通过该处理器我们可以点击圆形来使得世界变得多彩：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgViewer::Viewer viewer;
+    viewer.addEventHandler( new SetShapeColorHandler );
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+7. 我们很快就会看到geode1（中间）与geode2（左侧）中的任意一个被点击时，两个对象会同时发生变化。但是geode3（右侧）则始终是独立的。
+
+.. figure:: _images/osgcookbook_2.2.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+geode3节点进行深拷贝，从而如果其成员变量指向任意对象，这些对象所分配的内存也会被拷贝。相反，浅拷贝意味着拷贝的成员指向将会与原始节点共享相同的内存块。两者之间的区别可以通过下图进行解释：
+
+.. figure:: _images/osgcookbook_2.3.png
+   :alt: image
+
+   image
+
+在这里clone()方法通过调用拷贝构造函数分配一个相同类型的新对象。这仅是一行实现：
+
+::
+
+    virtual osg::Object* clone(const osg::CopyOp& copyop) const
+      { return new YourClass(*this, copyop); }
+
+YourClass指用作OSG场景对象的任意类名。我们可以阅读OSG源码的src/osg/CopyOp.cpp的内容了解关于第二个参数copyop的细节。
+
+Computing the world bounding box of any node
+--------------------------------------------
+
+通过学习其他的书籍与资料，我们也许已经知道节点使用边界圆而不是坐标方框。我们也许会同时知道osg::ComputeBoundsVisitor类可以通过访问节点及其子场景图计算边界框。但是在本节中，我们将会介绍关于整个计算过程以及这里所使用的局部到世界转换的更多细节。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+我们将会创建一个简单的动画场景并实时计算某些对象的边界框，并显示所得到的边界框。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/ComputeBoundsVisitor>
+    #include <osg/ShapeDrawable>
+    #include <osg/AnimationPath>
+    #include <osg/MatrixTransform>
+    #include <osg/PolygonMode>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+2. BoundingBoxCallback类可以为我们计算真实世界的边界框。我们需要向其传递一个节点列表，并通过依次添加每个节点的局部边界来扩展世界框：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class BoundingBoxCallback : public osg::NodeCallback
+    {
+    public:
+      virtual void operator()( osg::Node* node, osg::NodeVisitor* nv )
+      {
+      }
+      osg::NodePath _nodesToCompute;
+    };
+
+3. 在operator()实现中，我们会应用一些技巧：osg::ComputeBoundsVisitor类会以其父节点的参考帧为准计算节点的边界框。然后我们必须在将其添加到世界方框变量之前使用localToWorld矩阵重新计算世界坐标中的向量：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::BoundingBox bb;
+    for ( unsigned int i=0; i<_nodesToCompute.size(); ++i )
+    {
+      osg::Node* node = _nodesToCompute[i];
+      osg::ComputeBoundsVisitor cbbv;
+      node->accept( cbbv );
+      osg::BoundingBox localBB = cbbv.getBoundingBox();
+      osg::Matrix localToWorld = osg::computeLocalToWorld(
+        node->getParent(0)->getParentalNodePaths()[0] );
+      for ( unsigned int i=0; i<8; ++i )
+      bb.expandBy( localBB.corner(i) * localToWorld );
+    }
+
+4. 将所得的结果（世界坐标）应用到变换节点并使其在整个场景中可见：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* trans =
+      static_cast<osg::MatrixTransform*>(node);
+    trans->setMatrix(
+      osg::Matrix::scale(bb.xMax()-bb.xMin(), bb.yMax()-bb.yMin(),
+        bb.zMax()-bb.zMin()) *
+      osg::Matrix::translate(bb.center()) );
+
+5. 我们希望创建一个名为createAnimationPath()的函数用于这里创建动画路径，并使得边界框的计算更为动态：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::AnimationPath* createAnimationPath( float radius, float time )
+    {
+      osg::ref_ptr<osg::AnimationPath> path =
+        new osg::AnimationPath;
+      path->setLoopMode( osg::AnimationPath::LOOP );
+      unsigned int numSamples = 32;
+      float delta_yaw = 2.0f * osg::PI/((float)numSamples - 1.0f);
+      float delta_time = time / (float)numSamples;
+      for ( unsigned int i=0; i<numSamples; ++i )
+      {
+        float yaw = delta_yaw * (float)i;
+        osg::Vec3 pos( sinf(yaw)*radius, cosf(yaw)*radius, 0.0f );
+        osg::Quat rot( -yaw, osg::Z_AXIS );
+        path->insert( delta_time * (float)i,
+          osg::AnimationPath::ControlPoint(pos, rot) );
+      }
+      return path.release();
+    }
+
+6. 在主体部分，我们首先使用一个绕圈飞行的Cessna，一辆卡车以及示例地形创建场景。所有的模型文件都可以在OSG示例数据集中找到：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::MatrixTransform> cessna =  
+      new osg::MatrixTransform;
+    cessna->addChild(
+      osgDB::readNodeFile("cessna.osgt.0,0,90.rot") );
+    osg::ref_ptr<osg::AnimationPathCallback> apcb =
+      new osg::AnimationPathCallback;
+    apcb->setAnimationPath( createAnimationPath(50.0f, 6.0f) );
+    cessna->setUpdateCallback( apcb.get() );
+    osg::ref_ptr<osg::MatrixTransform> dumptruck =
+      new osg::MatrixTransform;
+    dumptruck->addChild( osgDB::readNodeFile("dumptruck.osgt") );
+    dumptruck->setMatrix( osg::Matrix::translate(0.0f, 0.0f, -100.0f) );
+    osg::ref_ptr<osg::MatrixTransform> models =
+      new osg::MatrixTransform;
+    models->addChild( cessna.get() );
+    models->addChild( dumptruck.get() );
+    models->setMatrix( osg::Matrix::translate(0.0f, 0.0f, 200.0f) );
+
+7. Cessna与卡车将会以一种复杂的方式添加进来用于计算世界边框：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<BoundingBoxCallback> bbcb =
+      new BoundingBoxCallback;
+    bbcb->_nodesToCompute.push_back( cessna.get() );
+    bbcb->_nodesToCompute.push_back( dumptruck.get() );
+
+8. 在场景图中构建方形用于边界：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( new osg::ShapeDrawable(new osg::Box) );
+    osg::ref_ptr<osg::MatrixTransform> boundingBoxNode =
+      new osg::MatrixTransform;
+    boundingBoxNode->addChild( geode.get() );
+    boundingBoxNode->setUpdateCallback( bbcb.get() );
+    boundingBoxNode->getOrCreateStateSet()->setAttributeAndModes(
+      new osg::PolygonMode(osg::PolygonMode::FRONT_AND_BACK,
+        osg::PolygonMode::LINE) );
+    boundingBoxNode->getOrCreateStateSet()->setMode(
+      GL_LIGHTING, osg::StateAttribute::OFF );
+
+9. 构建场景并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( models.get() );
+    root->addChild( osgDB::readNodeFile("lz.osgt") );
+    root->addChild( boundingBoxNode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+10. 我们将会看到边框会随着Cessna的运动而改变其大小。但是他总会精确的包含Cessna与卡车模型，如下面的截图所示：
+
+.. figure:: _images/osgcookbook_2.4.png
+   :alt: image
+
+   image
+
+11. 试着将第3步中的输入行以如下类型进行提交：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Matrix localToWorld;/* = osg::computeLocalToWorld(
+      node->getParent(0)->getParentalNodePaths()[0] ); */
+
+然后重新构建并查看区别。我们能否知道变化的原因呢？
+
+How it works...
+~~~~~~~~~~~~~~~
+
+场景图中的所有节点具有其自己的局部坐标系统。当我们变换并旋转变换节点时，这意味着我们是在其父节点的坐标系统内改变其位置与方向。这使得所有的变换发生在局部空间而不是世界空间。而应用到节点的矩阵也被看作将节点空间映射到父节点空间的变换矩阵。
+
+要计算指定点的世界坐标，我们首先要找出他所在的局部空间，然后获取节点的父节点，父节点的父节点，依次类推，直到我们到达场景根节点。这样我们就有了一个由根节点到包含该点的节点的节点路径。通过节点路径，我们就可以应用所有的变换矩阵并获得一个完整的局部到世界的矩阵。
+
+父节点路径的集合是通过getParentalNodePaths()方法获得的。他有多条路径，因为一个OSG节点可以有多个父节点。而要计算本地到世界矩阵，直接使用节点路径作为参数调用osg::computeLocalToWorld()函数即可。还有一个名为osg::computeWorldToLocal()的函数，该函数用来计算世界空间某点的局部表示。
+
+Creating a running car
+----------------------
+
+本节的目标很容易理解但不容易实现。他需要另一本书来告诉我们如何制作一个足够真实的汽车模型并将其高效的载入场景图中，同时如何组合各部件并使轮子转动起来。所以在这里我们简化问题－我们将会使用基本的形状实现一个非常简陋的汽车部分，并在组合过程中演示场景图的使用。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+在这里我们所需要做的就是使用变换节点，这是OSG库中最基本的类。但是熟练掌握该类并不容易。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/ShapeDrawable>
+    #include <osg/AnimationPath>
+    #include <osg/MatrixTransform>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+2. 便利函数createTransformNode()将会为我们所拥有的每一个组成形状创建一个变换节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* createTransformNode( osg::Drawable*
+      shape, const osg::Matrix& matrix )
+    {
+      osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+      geode->addDrawable( shape );
+      osg::ref_ptr<osg::MatrixTransform> trans =
+        new osg::MatrixTransform;
+      trans->addChild( geode.get() );
+      trans->setMatrix( matrix );
+      return trans.release();
+    }
+
+3. 我们希望使用一个动画路径回调使得轮子快速变化。注意，我们在旋转轮子时同时在Z轴上添加了一个非常小的偏移。他使得这里的动画更为真实：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::AnimationPathCallback* createWheelAnimation(
+      const osg::Vec3& base )
+    {
+      osg::ref_ptr<osg::AnimationPath> wheelPath =
+        new osg::AnimationPath;
+      wheelPath->setLoopMode( osg::AnimationPath::LOOP );
+      wheelPath->insert( 0.0, osg::AnimationPath::ControlPoint(
+        base, osg::Quat()) );
+      wheelPath->insert( 0.01, osg::AnimationPath::ControlPoint(
+        base + osg::Vec3(0.0f, 0.02f, 0.0f), osg::Quat(
+          osg::PI_2, osg::Z_AXIS)) );
+      wheelPath->insert( 0.02, osg::AnimationPath::ControlPoint(
+        base + osg::Vec3(0.0f,-0.02f, 0.0f), osg::Quat(
+          osg::PI, osg::Z_AXIS)) );
+      osg::ref_ptr<osg::AnimationPathCallback> apcb =
+        new osg::AnimationPathCallback;
+      apcb->setAnimationPath( wheelPath.get() );
+      return apcb.release();
+    }
+
+4. 在主体部分，我们简陋的汽车有四个组成部分：四个轮子，每两个轮子之间的轴，车体（这里我们只使用一个方框来表示）以及将所有部分连接起来的主轴，如下图所示：
+
+.. figure:: _images/osgcookbook_2.5.png
+   :alt: image
+
+   image
+
+5. 默认情况下，每个组成部分原型的几何中心都位于原点；而柱面的高度方向为Z轴：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    // The prototype of the main rod
+    osg::ref_ptr<osg::ShapeDrawable> mainRodShape =
+      new osg::ShapeDrawable( new osg::Cylinder(
+        osg::Vec3(), 0.4f, 10.0f) );
+    // The prototype of the coupling (wheel) rod
+    osg::ref_ptr<osg::ShapeDrawable> wheelRodShape =
+      new osg::ShapeDrawable( new osg::Cylinder(
+        osg::Vec3(), 0.4f, 8.0f) );
+    // The prototypes of the wheel and the car body
+    osg::ref_ptr<osg::ShapeDrawable> wheelShape =
+      new osg::ShapeDrawable( new osg::Cylinder(
+        osg::Vec3(), 2.0f, 1.0f) );
+    osg::ref_ptr<osg::ShapeDrawable> bodyShape =
+      new osg::ShapeDrawable( new osg::Box(
+        osg::Vec3(), 6.0f, 4.0f, 14.0f) );
+
+6. 车轮将会移动到轴的尾端：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* wheel1 = createTransformNode(
+      wheelShape.get(), osg::Matrix::translate(0.0f, 0.0f,-4.0f) );
+    wheel1->setUpdateCallback(
+      createWheelAnimation(osg::Vec3(0.0f, 0.0f,-4.0f)) );
+    osg::MatrixTransform* wheel2 = createTransformNode(
+      wheelShape.get(), osg::Matrix::translate(0.0f, 0.0f, 4.0f) );
+    wheel2->setUpdateCallback(
+      createWheelAnimation(osg::Vec3(0.0f, 0.0f, 4.0f)) );
+
+7. 而轮轴本身将会旋转并移动到主轴的尾端：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* wheelRod1 = createTransformNode(
+      wheelRodShape.get(),
+    osg::Matrix::rotate(osg::Z_AXIS, osg::X_AXIS) *
+      osg::Matrix::translate(0.0f, 0.0f,-5.0f) );
+    wheelRod1->addChild( wheel1 );
+    wheelRod1->addChild( wheel2 );
+
+8. 对于另一个车轴，我们将会直接由wheelRod1的变换节点拷贝。在这里进行浅拷贝将会是不错的选择，从而子车轮与动画将会被共享。在将复制所得的轴移动到一个合适的位置之后，现在我们就有了一个完整的车轮系统：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* wheelRod2 =
+      static_cast<osg::MatrixTransform*>(
+        wheelRod1->clone(osg::CopyOp::SHALLOW_COPY) );
+    wheelRod2->setMatrix( osg::Matrix::rotate(osg::Z_AXIS,
+      osg::X_AXIS) * osg::Matrix::translate(0.0f, 0.0f, 5.0f) );
+
+9. 最后，将车主体放置在主轴上并完成组装工作。所有三个部件应被添加到主轴上从而保证其位于其局部坐标下：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* body = createTransformNode(
+      bodyShape.get(), osg::Matrix::translate(0.0f, 2.2f, 0.0f) );
+    osg::MatrixTransform* mainRod = createTransformNode(
+      mainRodShape.get(), osg::Matrix::identity() );
+    mainRod->addChild( wheelRod1 );
+    mainRod->addChild( wheelRod2 );
+    mainRod->addChild( body );
+
+10. 现在创建根节点并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( mainRod );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+11. 我们将会看到汽车在查看器中运动。当然，他没有纹理，车门，车窗或是动力系统。但是，为什么我们不在其他类似3dsmax，Maya或是Blender3D这样的软件中创建漂亮的模型并替换这里所用的基本形状呢？如果我们对构建视觉良好的场景感兴趣，我们可以尝试一下。
+
+.. figure:: _images/osgcookbook_2.6.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+尽管所得的结果并不会让人激动，但他却一个演示局部坐标使用以及特性骨骼的基本概念的好例子。
+
+当然，还有更多的方法来实现这样一个组合汽车模型，而且我们可以导入一些漂亮的模型来替换我们的基本形状。我们可以进行尝试。
+
+本节场景图的构建如下图所示：
+
+.. figure:: _images/osgcookbook_2.7.png
+   :alt: image
+
+   image
+
+Mirroring the scene graph
+-------------------------
+
+场景图镜像，或者换句话说，将场景放置在镜子中作为反射，也可以通过指定其他的变换节点作为原始场景的父节点来实现。他会导致一切内容进行二次渲染，并且可以与某些渲染到纹理技术集成来模拟真正的镜子，水反射，阴影，以及其他反射效果。这里所描述的解决方案会在第6章中再次使用来创建简单的水反射效果。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+下面的代码非常短小并且稍后可以在其他章节中重用。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/ClipNode>
+    #include <osg/MatrixTransform>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+    Load a model into the scene graph first:
+    osg::ArgumentParser arguments( &argc, argv );
+    osg::ref_ptr<osg::Node> scene = osgDB::readNodeFiles(
+      arguments );
+    if ( !scene ) scene = osgDB::readNodeFile("cessna.osg");
+
+2. 接下来重要的步骤是生成镜像矩阵。我们通过相对XOY平面向下反转生成模型镜像，同时沿Z轴也有一个小变换来表示镜子的高度。这里的osg::Matrix::scale()函数会将反射的模型放置在Z轴的反面，而osg::Matrix::translate()函数用来设置缩放枢轴点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    float z = -10.0f;
+    osg::ref_ptr<osg::MatrixTransform> reverse =
+      new osg::MatrixTransform;
+    reverse->preMult(osg::Matrix::translate(0.0f, 0.0f, -z) *
+      osg::Matrix::scale(1.0f, 1.0f, -1.0f) *
+      osg::Matrix::translate(0.0f, 0.0f, z) );
+    reverse->addChild( scene.get() );
+
+3. 允许裁剪移除超出镜子的镜像部分。在这里也许不会有效果，但是会有助于我们稍后处理水纹模拟示例：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::ClipPlane> clipPlane = new osg::ClipPlane;
+    clipPlane->setClipPlane( 0.0, 0.0, -1.0, z );
+    clipPlane->setClipPlaneNum( 0 );
+    osg::ref_ptr<osg::ClipNode> clipNode = new osg::ClipNode;
+    clipNode->addClipPlane( clipPlane.get() );
+    clipNode->addChild( reverse.get() );
+
+4. 现在同时将原始场景与反转场景添加到根节点并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( scene.get() );
+    root->addChild( clipNode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+5. 结果如下面的截图所示。现在也许并不够有趣，但是很快我们就会发现他是其他一些复杂效果，例如水面反射与阴影实现，的基础。
+
+.. figure:: _images/osgcookbook_2.8.png
+   :alt: image
+
+   image
+
+There is more...
+~~~~~~~~~~~~~~~~
+
+如果我们对反转场景感兴趣，还有一些示例可供我们理解，例如，http://nehe.gamedev.net/data/lessons/lesson.asp?lesson=26
+处的NeHe OpenGL指南。
+
+OSG源码也通过osg::Stencil类提供了一个很好的示例用于截面测试。参考examples/osgreflect以了解详细内容。
+
+Designing a breadth-first node visitor
+--------------------------------------
+
+在图形程序中，广度优先搜索（BFS）是一种起始于根节点并且在深入之前遍历所有邻居节点的搜索算法。这不同于osg::NodeVisitor类的默认行为，后者是深度优先搜索（DFS）。在本节中我们将会尝试实现BFS访问器来显示如何对基本的OSG类进行修改以满足我们的使用。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+首先我们必须由osg::NodeVisitor类继承场景一个新的节点访问器。在这里需要包含的头文件如下：
+
+::
+
+    #include <osg/NodeVisitor>
+    #include <deque>
+
+要使得访问器工作必须重写两个虚函数：一个是reset()函数，该函数会将所有的成员变量重置为其初始状态；另一个是apply()方法，该方法会接受一个osg::Node类作为输入参数。当遍历场景图时，所有的OSG节点必须被重定向到该方法，所以出于创建BFS访问器的目的，我们将我们自己的traverseBFS()方法放置在这里：
+
+::
+
+    class BFSVisitor : public osg::NodeVisitor
+    {
+    public:
+      BFSVisitor() { setVisitorType(TRAVERSE_ALL_CHILDREN); }
+      virtual void reset() { _pendingNodes.clear(); }
+      virtual void apply( osg::Node& node ) { traverseBFS(node); }
+    protected:
+      virtual ~BFSVisitor() {}
+      void traverseBFS( osg::Node& node );
+      std::deque<osg::Node*> _pendingNodes;
+    };
+
+新的场景图遍历机制实现如下。我们会查找所有的子节点并将其压入队列，然后从头处理队列。事实上队列可以被看作一个FIFO（先进先出）管道。邻居节点将会被一同探索并处理，而低层的节点将会一直等待直到高层的节点全部完成，依次类推：
+
+::
+
+    void BFSVisitor::traverseBFS( osg::Node& node )
+    {
+      osg::Group* group = node.asGroup();
+      if ( !group ) return;
+      for ( unsigned int i=0; i<group->getNumChildren(); ++i )
+      {
+        _pendingNodes.push_back( group->getChild(i) );
+      }
+      while ( _pendingNodes.size()>0 )
+      {
+        osg::Node* node = _pendingNodes.front();
+        _pendingNodes.pop_front();
+        node->accept(*this);
+      }
+    }
+
+现在我们可以在实际的工作中使用BFSVisitor。
+
+1. 包含其他所需的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osgDB/ReadFile>
+    #include <osgUtil/PrintVisitor>
+    #include <iostream>
+
+2. 我们将会在遍历场景图时输出每一个节点的类名：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class BFSPrintVisitor : public BFSVisitor
+    {
+    public:
+      virtual void apply( osg::Node& node )
+      {
+        std::cout << node.libraryName() << "::"
+          <<node.className() << std::endl;
+        traverseBFS(node);
+      }
+    };
+
+3. 在主体部分，我们首先由文件读取一个模型：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ArgumentParser arguments( &argc, argv );
+    osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles( arguments );
+    if ( !root ) root = osgDB::readNodeFile("osgcool.osg");
+
+4. 在这里osgUtil::PrintVisitor类被用来显示DFS访问器的遍历序列：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    std::cout << "DFS Visitor traversal: " << std::endl;
+    osgUtil::PrintVisitor pv( std::cout );
+    root->accept( pv );
+    std::cout << std::endl;
+
+5. 现在使用新的BFS遍历来输出节点信息。我们也许需要启动一个终端并在文本模式下运行程序：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    std::cout << "BFS Visitor traversal: " << std::endl;
+    BFSPrintVisitor bpv;
+    root->accept( bpv );
+    return 0;
+
+6. 对比结果如下图所示。我们可以很容易发现DFS与BFS访问器之间的区别。
+
+.. figure:: _images/osgcookbook_2.9.png
+   :alt: image
+
+   image
+
+There's more...
+~~~~~~~~~~~~~~~
+
+宽度优先搜索可以用来查找两个节点之间的最短路径，或是实现一些其他的算法。一句话，他并不适合更新与渲染处理，因为后者以一种类似树的结构封装OpenGL状态变换与局部到世界的变换。深度优先解决方案会在每一个分支尽可能深入然后回溯，依然是为大多数场景图访问器所喜欢的，例如osg::NodeVisitor类。
+
+关于宽度优先与深度优先搜索的更多信息可以在下面的网址找到：
+
+http://en.wikipedia.org/wiki/Breadth-first_search
+
+http://en.wikipedia.org/wiki/Depth-first_search
+
+Implementing a background image node
+------------------------------------
+
+也许我们之前也尝试过背景图片但是失败了。这里的困难在于如果我们曾尝试使用一个HUD系统来应用背景图片，HUD系统总是在主场景之后被渲染，他很难处理由主场景所设置的深度缓冲区值。幸运的是，在本节中，我们有一个使用深度测试的解决方案。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+指定一个图片作为背景图片并且载入任意的场景，并检测其是否在背景之前显示来验证我们解决方案的正确性。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/Depth>
+    #include <osg/Texture2D>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+2. 载入背景图片并将其映射到四边形几何体：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Texture2D> texture = new osg::Texture2D;
+    osg::ref_ptr<osg::Image> image = osgDB::readImageFile(
+      "Images/osg256.png" );
+    texture->setImage( image.get() );
+    osg::ref_ptr<osg::Drawable> quad =
+      osg::createTexturedQuadGeometry( osg::Vec3(),
+         osg::Vec3(1.0f, 0.0f, 0.0f), osg::Vec3(0.0f, 1.0f, 0.0f) );
+    quad->getOrCreateStateSet()->setTextureAttributeAndModes(
+      0, texture.get() );
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( quad.get() );
+
+3. 为背景图片准备HUD相机。他必须完全填充场景从而我们可以使用正交投影。这里其他一些关键点包含禁止相机上的裁剪并将清除掩码设置为0。这是因为背景不应被裁剪，而且他不应影响主场景所生成的颜色与深度缓冲区。
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Camera> camera = new osg::Camera;
+    camera->setCullingActive( false );
+    camera->setClearMask( 0 );
+    camera->setAllowEventFocus( false );
+    camera->setReferenceFrame( osg::Transform::ABSOLUTE_RF );
+    camera->setRenderOrder( osg::Camera::POST_RENDER );
+    camera->setProjectionMatrix( osg::Matrix::ortho2D(
+      0.0, 1.0, 0.0, 1.0) );
+    camera->addChild( geode.get() );
+
+4. 防止背景为灯光所影响并设置深度测试值。我们会在稍后解释原因：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::StateSet* ss = camera->getOrCreateStateSet();
+    ss->setMode( GL_LIGHTING, osg::StateAttribute::OFF );
+    ss->setAttributeAndModes( new osg::Depth(
+      osg::Depth::LEQUAL, 1.0, 1.0) );
+
+5. 现在将背景相机与其他场景添加到根节点并设置我们现在所拥有的内容：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( camera.get() );
+    root->addChild( osgDB::readNodeFile("cessna.osg") );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+6. 看起来一切正常，而结果如下面的截图所示。无论是否相信，程序中最重要的代码行是osg::Depth状态属性的添加。试着将其隐藏掉并查看区别。
+
+.. figure:: _images/osgcookbook_2.10.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+背景图片实现的关键可以集中到一行，也就是，将背景图片的深度值重新调整为[1.0,1.0]。
+
+这可以保证后渲染（post-rendered）背景的每一个深度值为1.0，而且他不会通过深度测试，除非原始深度值等于或大于1.0（后者一定是不可能的），如下面的代码段所示：
+
+::
+
+    setAttributeAndModes( new osg::Depth(osg::Depth::LEQUAL, 1.0, 1.0) );
+
+那么原始深度值何时为1.0呢？答案很明显：没有内容显示时才会发生。而背景的真正含义实际上是当没有其他场景对象显示时所需要显示的内容。所以我们现在以一种完美的方式完成了该任务。
+
+Making your node always face the screen
+---------------------------------------
+
+使得某物面向场景？是的，这正是osg::Billboard类为我们所实现的，而osgText::Text类有一个自动旋转文本面向屏幕的类似特征。但是这次我们将会操作节点，并且显示如何依据全局模型视图矩阵来修改变换节点。这里所使用的方法也可以进行扩展来实现其他一些小功能，例如，在模型编辑器窗口中显示小的XYZ坐标轴参考，或是射击游戏中跟随鼠标的望远镜。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+本节内容对于阅读与理解非常简单。但是这里裁剪回调的使用会有助于后续章节来实现更为复杂的示例。记住这些或是可能时放置一个书签。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/MatrixTransform>
+    #include <osgDB/ReadFile>
+    #include <osgUtil/CullVisitor>
+    #include <osgViewer/Viewer>
+
+2. 声明一个节点回调并且我们将会修改特定节点的变换矩阵来确保其总是面向屏幕，而这正是公告板节点的行为：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class BillboardCallback : public osg::NodeCallback
+    {
+    public:
+      BillboardCallback( osg::MatrixTransform* billboard )
+      : _billboardNode(billboard) {}
+      virtual void operator()( osg::Node* node, osg::NodeVisitor* nv )
+      {
+       ...
+      }
+    protected:
+      osg::observer_ptr<osg::MatrixTransform> _billboardNode;
+    };
+
+3. 在operator()实现中，首先要小心动态类型变换。我们尝试将输入节点访问器指针转换为一个osgUtil::CullVisitor对象。他只会在裁剪遍历中获取。
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgUtil::CullVisitor* cv =
+      dynamic_cast<osgUtil::CullVisitor*>(nv);
+    if ( _billboardNode.valid() && cv )
+    {
+      osg::Vec3d translation, scale;
+      osg::Quat rotation, so;
+      cv->getModelViewMatrix()->decompose( translation, rotation,
+        scale, so );
+      osg::Matrixd matrix( rotation.inverse() );
+      _billboardNode->setMatrix( matrix );
+    }
+    traverse( node, nv );
+
+这个代码片段将矩阵分解为变换，旋转，缩放向量与缩放朝向。
+
+4. 要使得节点总是朝向屏幕，我们所需要做的就是由应用在其上的模型视图矩形中移除旋转部分。这也正是我们在这里设置反转旋转矩阵的原因。而该旋转部分与前一个旋转部将会在矩阵乘法处理中彼此关闭。
+5. 在主体部分，载入Cessna模型并将其添加到变换节点，该节点仅接受反转旋转矩阵：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::MatrixTransform> billboardNode =
+      new osg::MatrixTransform;
+    billboardNode->addChild( osgDB::readNodeFile("cessna.osg") );
+
+6. 将公告板节点以及用作参考的地形节点添加到根节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( billboardNode.get() );
+    root->addChild( osgDB::readNodeFile("lz.osg") );
+    root->addCullCallback(
+      new BillboardCallback(billboardNode.get()) );
+
+稍后我们将会解释将BillboardCallback而不是公告板节点本身放置在根节点的原因。
+
+7. 启动查看器：
+
+       osgViewer::Viewer viewer; viewer.setSceneData( root.get() );
+       return viewer.run();
+
+8. Cessna依然位于右侧并且与地形具有正确的隐藏关系。但是我们很快就会发现我们仅能看到Cessna的一侧，就如同他是2D的一般。也就是说，现在Cessna面向屏幕，如下面的截图所示：
+
+.. figure:: _images/osgcookbook_2.11.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+将回调添加到根节点与添加到billboardNode之间的区别在于设置矩阵与应用矩阵的初始顺序。让我们看一下第一种情况：当回调被设置到根节点时，他会在裁剪访问器到达根节点时执行，并且调用变换节点billboardNode的setMatrix()方法。之后，当裁剪访问器遍历到节点billboardNode时，变换矩阵将会被应用到公告板并且在渲染过程中高效完成。这会导致节点的正确朝向（面向屏幕）。
+
+但是如果我们将回调直接设置到billboardNode节点，则会出现一些问题。新设置的矩阵不会在裁剪回调中立即工作。所以新的朝向值仅会在下一帧中起作用。事实上，这会导致模型抖动，从而导致不可预期的结果。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+有多种可以遍历场景图并触发回调的访问器类型。我们可以通过在我们自定义节点的traverse()方法，或是回调的operator()方法中进行动态类型转换获得。下表显示了这些节点访问器，类型枚举（可以通过调用getVisitorType()方法获得）与描述：
+
+.. figure:: _images/osgcookbook_2.12.png
+   :alt: image
+
+   image
+
+对于其他的公告板实现，可以参看osg::Billboard与osg::AutoTransform类的声明。并且在OSG源码中的examples/osgforest与examples/osgautotransform中也有一些相关的示例。
+
+Using draw callbacks to execute NVIDIA Cg functions
+---------------------------------------------------
+
+Cg语言（用于图像的C）是由NVIDIA开发的高层阴影语言。他适用于GPU编程并且可以同时支持DirectX(HLSL)与OpenGL(GLSL)阴影器编程。他被广泛用于现代PC游戏与3D程序中。
+
+当然，尽管我们不能利用Cg语言的任何HLSL特性，但是依然值得将其与OSG功能集成。在考虑使用阴影器参数，参数缓冲区，CgFX以及其他高级Cg特性之前，我们首先尝试运行一些简单的Cg程序。这次我们将会使用osg::Camera的绘制回调。
+
+Getting ready
+~~~~~~~~~~~~~
+
+首先在NVIDIA网站查看并下载Cg工具集。他同时支持Linux，Mac OS
+X与Windows系统。
+
+http://developer.nvidia.com/cg-toolkit
+
+在这里我们并没有空间介绍Cg语法与示例代码。我们可以在网络上查找一些指南。
+
+我们程序的CMake脚本应进行修改来查找Cg包含目录与库。下面的代码段应是一个容易阅读的示例：
+
+::
+
+    FIND_PATH(CG_INCLUDE_PATH Cg/cg.h)
+    FIND_LIBRARY(CG_GL_LIBRARY CgGL)
+    FIND_LIBRARY(CG_LIBRARY Cg)
+    INCLUDE_DIRECTORIES(${CG_INCLUDE_PATH })
+    TARGET_LINK_LIBRARIES(${EXAMPLE_NAME}
+      ${CG_LIBRARY} ${CG_GL_LIBRARY})
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+下面让我们首先创建用于使用Cg程序状态渲染的绘制回调。
+
+1. 包含必须的头文件并开始构建一些类用于集成Cg阴影特性：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <Cg/cg.h>
+    #include <Cg/cgGL.h>
+    #include <osg/Camera>
+
+2. 当使用Cg编程时最重要的步骤是在实际的绘制之前使能Cg并在之后关闭Cg；这会在实际的绘制操作之前使得特定的阴影器工作，并在之后禁止来确保他们不会影响其他的处理步骤。要使用相机回调进行实现，我们必须设计一个先绘制与后绘制回调，两者均使用相同的Cg变量。所以，我们就可以拥有一个管理CGprofile与CGprogram对象列表的基本回调：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class CgDrawCallback : public osg::Camera::DrawCallback
+    {
+    public:
+      void addProfile( CGprofile profile ) {
+        _profiles.push_back(profile); }
+      void addCompiledProgram( CGprogram prog ) {
+        _programs.push_back(prog); }
+    protected:
+      std::vector<CGprofile> _profiles;
+      std::vector<CGprogram> _programs;
+    };
+
+3. 当处理相同的Cg对象时，CgStartDrawCallback与CgEndDrawCallback类将会具有不同的行为。注意，CgStartDrawCallback类有一个额外的\_initialized变量来帮助其第一次执行时初始化程序：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class CgStartDrawCallback : public CgDrawCallback
+    {
+    public:
+      CgStartDrawCallback() : _initialized(false) {}
+      virtual void operator()( osg::RenderInfo&
+        renderInfo ) const;
+    protected:
+      mutable bool _initialized;
+    };
+    class CgEndDrawCallback : public CgDrawCallback
+    {
+    public:
+      virtual void operator()( osg::RenderInfo&
+        renderInfo ) const;
+    };
+
+4. 下面是这两个绘制回调的实现。这里的两个operator()方法仅会在相机子节点的绘制处理之前与之后执行：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    void CgStartDrawCallback::operator()( osg::RenderInfo&
+      renderInfo ) const
+    {
+      if ( !_initialized )
+      {
+        // Load all Cg shader programs
+        for ( unsigned int i=0; i<_programs.size(); ++i )
+        cgGLLoadProgram( _programs[i] );
+        _initialized = true;
+      }
+      // Bind the programs to current graphics context
+      for ( unsigned int i=0; i<_programs.size(); ++i )
+      cgGLBindProgram( _programs[i] );
+      // Enable Cg profiles to work under specified devices
+      for ( unsigned int i=0; i<_profiles.size(); ++i )
+      cgGLEnableProfile( _profiles[i] );
+    }
+    void CgEndDrawCallback::operator()( osg::RenderInfo&
+      renderInfo ) const
+    {
+      // Disable profiles after the drawing
+      for ( unsigned int i=0; i<_profiles.size(); ++i )
+      cgGLDisableProfile( _profiles[i] );
+    }
+
+5. 在完成回调类之后，现在是使用OSG与NVIDIA
+   Cg创建一个小程序的时候了。首先让我们包含头文件并且创建一个非常简单的Cg程序渲染顶点作为最终的像素颜色：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    static const char* cgProgramCode = {
+      "struct app_input {\n"
+        "float4 vertex : POSITION;\n"
+        "float4 normal : NORMAL;\n"
+      "};\n"
+      "struct vertex_to_fragment {\n"
+        "float4 position : POSITION;\n"
+        "float3 normal3  : TEXCOORD0;\n"
+      "};\n"
+      "vertex_to_fragment vertex_main(app_input input)\n"
+      "{\n"
+        "vertex_to_fragment output;\n"
+        "output.position = mul(glstate.matrix.mvp,
+          input.vertex);\n"
+        "output.normal3 = input.normal.xyz;\n"
+        "return output;\n"
+      "}\n"
+      "float4 fragment_main(vertex_to_fragment input) : COLOR\n"
+      "{\n"
+        "float4 output = float4(input.normal3.x, input.normal3.y,
+          input.normal3.z, 1.0);\n"
+      "return output;\n"
+      "}\n"
+    };
+
+6. Cg环境必须是全局的，并且我们会为所有Cg相关的问题设置一个错误回调：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    CGcontext g_context;
+    void error_callback()
+    {
+      CGerror lastError = static_cast<CGerror>( cgGetError() );
+      OSG_WARN << "Cg error: " << cgGetErrorString(lastError)
+        << std::endl;
+      if ( lastError == CG_COMPILER_ERROR )
+      OSG_WARN << std::string(cgGetLastListing(g_context))
+        << std::endl;
+    }
+
+7. 在主体部分，首先我们载入一个模型并分配两个回调：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ArgumentParser arguments( &argc, argv );
+    osg::ref_ptr<osg::Node> root = osgDB::readNodeFiles(
+      arguments );
+    if ( !root ) root = osgDB::readNodeFile( "cow.osg" );
+    osg::ref_ptr<CgStartDrawCallback> preCB =
+      new CgStartDrawCallback;
+    osg::ref_ptr<CgEndDrawCallback> postCB =
+      new CgEndDrawCallback;
+
+8. 初始化查看器，而更为重要的是，通过调用setUpViewInWindow()方法初始化图形环境：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgViewer::Viewer viewer;
+    viewer.getCamera()->setPreDrawCallback( preCB.get() );
+    viewer.getCamera()->setPostDrawCallback( postCB.get() );
+    viewer.setSceneData( root.get() );
+    viewer.setUpViewInWindow( 100, 100, 800, 600 );
+
+9. 在将其添加到回调对象之前初始化Cg变量。因为初始化过程要求OpenGL环境已创建并且成为当前环境，我们必须设置当前相机中所用的图形环境，并且设置内部的OpenGL渲染环境。现在我们将会理解我们应先初始化图形环境的原因了：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    CGprofile vertProfile, fragProfile;
+    CGprogram vertProg, fragProg;
+    osg::GraphicsContext* gc =
+      viewer.getCamera()->getGraphicsContext();
+    if ( gc )
+    {
+      gc->realize();
+      gc->makeCurrent();
+      g_context = cgCreateContext();
+      cgSetErrorCallback( error_callback );
+      vertProfile = cgGLGetLatestProfile(CG_GL_VERTEX);
+      vertProg = cgCreateProgram(
+        g_context, CG_SOURCE, cgProgramCode, vertProfile,
+          "vertex_main", NULL );
+      fragProfile = cgGLGetLatestProfile(CG_GL_FRAGMENT);
+      fragProg = cgCreateProgram(
+        g_context, CG_SOURCE, cgProgramCode, fragProfile,
+          "fragment_main", NULL );
+      gc->releaseContext();
+    }
+
+10. 将初始化的变量添加到回调并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    preCB->addProfile( vertProfile );
+    preCB->addProfile( fragProfile );
+    preCB->addCompiledProgram( vertProg );
+    preCB->addCompiledProgram( fragProg );
+    postCB->addProfile( vertProfile );
+    postCB->addProfile( fragProfile );
+    postCB->addCompiledProgram( vertProg );
+    postCB->addCompiledProgram( fragProg );
+    viewer.run();
+
+11. 最后，不要忘记所分配的Cg变量：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    if ( gc )
+    {
+      cgDestroyProgram( vertProg );
+      cgDestroyProgram( fragProg );
+      cgDestroyContext( g_context );
+    }
+    return 0;
+
+12. 好了，现在成功将其他阴影语言集成到OSG中的感觉是怎样的呢？如果我们熟悉Cg语言，我们可以尝试一些其他的阴影器并确定其是否起作用。
+
+.. figure:: _images/osgcookbook_2.13.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+本节值得关注的特性在于他强制图形环境的构建并用其来指定OpenGL设备与执行命令。我们也许会记得有一个依据用户特征创建新环境的createGraphicsContext()方法。是的，在这里他也可以起作用。而setUpViewInWindow()方法实际上在内部使用一个自动配置的特性对象执行该函数。
+
+还有一些其他setUpView\*()方法，所有这些方法可以构建不同行为的图形环境以供使用。我们可以获取osg::GraphicsContext对象并在模拟启动前用其来执行OpenGL调用。
+
+所以现在有三种方法来将基于OpenGL的OpenGL命令与库集成到OSG。第一种方法是继承并自定义osg::Drawable类。第二种方法是定义在osg::Camera类中的前绘制与后绘制回调，这可以管理某些子节点的额外状态但是也许会导致OpenGL命令重复。最后一种方法，直接利用渲染环境，当我们要执行某些初始化或测试时非常适用；但是在多线程模式下也许会导致严重的线程问题，因为相同的环境也许会为其他的OSG图形对象同时使用。
+
+集成其他的库是一个非常有趣的话题，所以会在其他的章节中再次提及。试着通过学习本节以及后续的章节来了解上面所讨论的三个方法的优点与缺点，但是在不同的程序中使用则我们自己的风险。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+OSG与NVIDIA
+Cg的另一种集成方法可以在第三方面的osgXl工程中找到（http://sourceforge.net/projects/osgxi/
+）。其osgCg模块现在通过将其作为状态属性接受来支持Cg与CgFX。
+
+最后，要了解关于NVIDIA
+Cg的更多内容，免费的Cg指南更适用阅读，我们可以在http://developer.nvidia.com/object/cg\_tutorial\_home.html
+处找到。
+
+Implementing a compass node
+---------------------------
+
+现在到了本章的最后一节，而这次我们将会做一些真正有趣的事情。我们将会尝试实现一个指南针并用在一个简单的地球场景中。指南针有助于我们在3D世界中标识方向。而且正如我们所知道的，如果我们处理某些3D地理信息系统（GIS）或是计算机游戏，这会使得我们的程序看起来专业且有用。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+1. 声明一个Compass类。他包含一个可变换的表盘与指针。方向将会由主场景相机的当前视图矩阵读取并计算，这应在模拟开始之前计算：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class Compass : public osg::Camera
+    {
+    public:
+      Compass();
+      Compass( const Compass& copy, osg::CopyOp
+        copyop=osg::CopyOp::SHALLOW_COPY );
+      META_Node( osg, Compass );
+      void setPlate( osg::MatrixTransform* plate ) {
+        _plateTransform = plate; }
+      void setNeedle( osg::MatrixTransform* needle ) {
+        _needleTransform = needle; }
+      void setMainCamera( osg::Camera* camera ) {
+        _mainCamera = camera; }
+      virtual void traverse( osg::NodeVisitor& nv );
+    protected:
+      virtual ~Compass();
+      osg::ref_ptr<osg::MatrixTransform> _plateTransform;
+      osg::ref_ptr<osg::MatrixTransform> _needleTransform;
+      osg::observer_ptr<osg::Camera> _mainCamera;
+    };
+
+2. 实现Compass类的拷贝构造函数。如果没有拷贝构造函数，我们就不能使用META\_Node宏来定义标准节点方法：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    Compass::Compass( const Compass& copy, osg::CopyOp copyop ):
+      osg::Camera(copy, copyop),
+      _plateTransform(copy._plateTransform),
+      _needleTransform(copy._needleTransform),
+      _mainCamera(copy._mainCamera)
+    {
+    }
+
+3. traverse()方法将会在整个场景图的每一帧的事件，更新与裁剪遍历中调用。覆盖该方法我们就会有拥有我们自己节点类型的自定义行为。
+4. 对于指南针，我们需要计算当前查看器方向与北向量（地球地理极点）的夹角，并旋转指针或表盘进行调整。在这里我们由主相机读取当前视图矩阵并移动表盘以适应该矩阵。这可以在裁剪遍历中完成，因为有多个元素影响查看器的位置与方向：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    void Compass::traverse( osg::NodeVisitor& nv )
+    {
+      if ( _mainCamera.valid() &&
+        nv.getVisitorType()==osg::NodeVisitor::CULL_VISITOR )
+      {
+        osg::Matrix matrix = _mainCamera->getViewMatrix();
+        matrix.setTrans( osg::Vec3() );
+        osg::Vec3 northVec = osg::Z_AXIS * matrix;
+        northVec.z() = 0.0f;
+        northVec.normalize();
+        osg::Vec3 axis = osg::Y_AXIS ^ northVec;
+        float angle = atan2(axis.length(), osg::Y_AXIS*northVec);
+        axis.normalize();
+        if ( _plateTransform.valid() )
+        _plateTransform->setMatrix( osg::Matrix::rotate(
+          angle, axis) );
+      }
+      _plateTransform->accept( nv );
+      _needleTransform->accept( nv );
+      osg::Camera::traverse( nv );
+    }
+
+5. 稍后我们将会解释为什么我们在这里直接调用accept()，以及为什么\_plateTransform与\_needleTransform节点不会被添加为指南针子节点的原因。
+
+现在指南针类可以用在含意的程序中。让我们来试一下。
+
+6. 首先包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/ShapeDrawable>
+    #include <osg/MatrixTransform>
+    #include <osg/Texture2D>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+7. 我们也许有多种方法来设计我们自己的指南针指针与表盘。但在本节中我们选择使用纹理四边形。使用透明背景创建指针图片，将其添加到表盘图片上，而所得到的结果对于我们的示例已足够漂亮了。示例图片如下图所示：
+
+.. figure:: _images/osgcookbook_2.14.png
+   :alt: image
+
+   image
+
+8. 为指针或表盘节点创建函数。高度参数用于计算这两个组件的Z顺序：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::MatrixTransform* createCompassPart( const std::string&
+      image, float radius, float height )
+    {
+      osg::Vec3 center(-radius, -radius, height);
+      osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+      geode->addDrawable(
+        createTexturedQuadGeometry(center, osg::Vec3(radius*2.0f,0.0f,
+    0.0f),
+          osg::Vec3(0.0f,radius*2.0f,0.0f)) );
+      osg::ref_ptr<osg::Texture2D> texture = new osg::Texture2D;
+      texture->setImage( osgDB::readImageFile(image) );
+      osg::ref_ptr<osg::MatrixTransform> part =
+        new osg::MatrixTransform;
+      part->getOrCreateStateSet()->setTextureAttributeAndModes(
+        0, texture.get() );
+      part->getOrCreateStateSet()->setRenderingHint(
+        osg::StateSet::TRANSPARENT_BIN );
+      part->addChild( geode.get() );
+      return part.release();
+    }
+
+9. 创建一个演示地球模型：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geode* createEarth( const std::string& filename )
+    {
+      osg::ref_ptr<osg::Texture2D> texture = new osg::Texture2D;
+      texture->setImage( osgDB::readImageFile(filename) );
+      osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+      geode->addDrawable( new osg::ShapeDrawable(
+        new osg::Sphere(osg::Vec3(), osg::WGS_84_RADIUS_POLAR)) );
+      geode->getOrCreateStateSet()->setTextureAttributeAndModes(
+        0, texture.get() );
+      return geode.release();
+    }
+
+10. 在主体部分，创建查看器并将主相机关联到指南针：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgViewer::Viewer viewer;
+    osg::ref_ptr<Compass> compass = new Compass;
+    compass->setMainCamera( viewer.getCamera() );
+    compass->setViewport( 0.0, 0.0, 200.0, 200.0 );
+    compass->setProjectionMatrix( osg::Matrixd::ortho(
+      -1.5, 1.5, -1.5, 1.5, -10.0, 10.0) );
+
+11. 将表盘与指针图片添加到指南针节点。指针必须显示在表盘上面，所以在这里他有一个较大的高度值：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    compass->setPlate( createCompassPart("compass_plate.png",
+      1.5f, -1.0f) );
+    compass->setNeedle( createCompassPart("compass_needle.png",
+      1.5f, 0.0f) );
+
+12. 2D指针南实际上是一个HUD相机。下面的代码定义了其基本行为：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    compass->setRenderOrder( osg::Camera::POST_RENDER );
+    compass->setClearMask( GL_DEPTH_BUFFER_BIT );
+    compass->setAllowEventFocus( false );
+    compass->setReferenceFrame( osg::Transform::ABSOLUTE_RF );
+    compass->getOrCreateStateSet()->setMode( GL_LIGHTING,
+      osg::StateAttribute::OFF );
+    compass->getOrCreateStateSet()->setMode( GL_BLEND,
+      osg::StateAttribute::ON );
+
+13. 将地球与指南针添加到根节点并启动查看器。地球图片文件可以在OSG示例数据集中找到：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild(
+      createEarth("Images/land_shallow_topo_2048.jpg") );
+    root->addChild( compass.get() );
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+14. 我们可以开始浏览场景且不需要担心确定虚拟世界中的方向，如果有一天我们真的迷失在复杂的3D场景中，退出程序并重新启动也许更为容易。
+
+.. figure:: _images/osgcookbook_2.15.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+在本节中，北向量被定义为世界坐标中的Z轴。这里我们所需要做的就是确定指南针的磁针如何指向北极，并相应的旋转变换节点（\_plateTransform或\_needleTransform）。仔细查看Google
+Earth程序我们就会发现，当我们浏览时指南针的表盘也会转动。
+
+修定在我们的简单3D世界中，我们面向正北方向，此时我们的指南针指针应指向场景的上部，也就是，实际上是Y轴的正方向。所以如果任何方向变化，他可以被看作人眼坐标Y轴与人眼坐标所计算的地球北向量之间角度的变化。
+
+使用视图矩阵变换世界北向量，而忽略位置偏移。之后计算旋转坐标轴（Y轴与北向量的向量积cross
+product，因为他们均位于视图坐标系统中）与角度，并依据我们自己的判断将其应用到指针或表盘节点。
+
+::
+
+    osg::Vec3 axis = osg::Y_AXIS ^ northVec;
+    float angle = atan2(axis.length(), osg::Y_AXIS*northVec);
+    axis.normalize();
+
+如果我们已经阅读了示例源码，我们也许会问的另一个问题是：为什么我们没有将指针与表盘节点添加到指南针，以及为什么他们没有被看作子节点却依然可以工作？好问题！而如果我们曾读过osg::Group类的实现，我们也许就会自己找到答案：
+
+::
+
+    void Group::traverse(NodeVisitor& nv)
+    {
+      for(NodeList::iterator itr=_children.begin();
+      itr!=_children.end(); ++itr)
+      {
+        (*itr)->accept(nv);
+      }
+    }
+
+当调用其超类的traverse()方法时，Compass类（以及派生自osg::Group的其他类）实际上会迭代每一个子节点并在其上调用accept()方法来使得遍历继续。但是在这里，操作是通过在变换节点\_plateTransform与\_needleTransform上直接调用accept()方法来完成的。这意味着这两个节点将会被遍历，就如同他们是指南针的子节点一样。有时这会带来灵活性。
+
+注意，osg::Camera类没有重写traverse()方法；他仅是简单的调用osg::Group的traverse()方法。这正是我们这里的策略起作用的原因。当然，如果我们决定将指针与表盘添加为指南针的子节点，一切也会正常作用。

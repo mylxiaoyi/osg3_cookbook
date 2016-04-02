@@ -1,0 +1,2062 @@
+Chapter 3: Editing Geometry Models
+==================================
+
+在本章中我们将会探讨：
+
+-  使用边框线创建多边形
+-  将2D形状变换为3D
+-  绘制NURBS表面
+-  在屏幕上绘制动态时钟
+-  绘制跟随模型的飘带
+-  选取并高亮模型
+-  选取模型的三角面
+-  选取模型上的点
+-  在阴影器中使用顶点置换
+-  使用绘制立即扩展（draw instanced extension）
+
+Introduction
+------------
+
+本章全部是关于创建并操作几何体。我们将会看到一些设计良好的示例显示如何满足特定用户的需求来创建参数化多边形，几何顶点动画，并利用如置换映射（displacement
+mapping）与立即绘制（draw instanced）等高级技术。
+
+我们必须非常熟悉osg::Geometry对象的构建以及顶点数组与基元集合的操作。我们将会略过这些内容的基本知识的介绍，并且在接下来的章节中直接操作某些实际程序。
+
+为了有助于快速实现某些动画模型，我们将会在通用的osgCookbook名字空间中添加一个新的函数。createAnimationPathCallback()函数将会生成可以应用到变换节点的圆形动画路径：
+
+::
+
+    osg::AnimationPathCallback* createAnimationPathCallback(
+      float radius, float time )
+    {
+      osg::ref_ptr<osg::AnimationPath> path =
+        new osg::AnimationPath;
+      path->setLoopMode( osg::AnimationPath::LOOP );
+      unsigned int numSamples = 32;
+      float delta_yaw = 2.0f * osg::PI/((float)numSamples - 1.0f);
+      float delta_time = time / (float)numSamples;
+      for ( unsigned int i=0; i<numSamples; ++i )
+      {
+        float yaw = delta_yaw * (float)i;
+        osg::Vec3 pos( sinf(yaw)*radius, cosf(yaw)*radius, 0.0f );
+        osg::Quat rot( -yaw, osg::Z_AXIS );
+        path->insert( delta_time * (float)i,
+          osg::AnimationPath::ControlPoint(pos, rot) );
+      }
+      osg::ref_ptr<osg::AnimationPathCallback> apcb =
+        new osg::AnimationPathCallback;
+      apcb->setAnimationPath( path.get() );
+      return apcb.release();
+    }
+
+Creating a polygon with borderlines
+-----------------------------------
+
+本章的第一节来自于GIS（地理信息系统）领域一个常见的功能。GIS数据总是包含空间特性部分与非空间属性部分。特性包含河流，道路，城市等，是使用点，线与多边形来表示的。而线与多边形的组合可以用来描述复杂形状，如湖，国土及其边界等。
+
+例如，我们可以使用一系列的三角形与四边形来绘制中国领土范围，然后使用相同的示例点，但使用不同的基元类型来绘制国家边界。
+
+下面就让我们开始创建这样的多边形与边界线的场景。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/LineWidth>
+    #include <osgUtil/Tessellator>
+    #include <osgViewer/Viewer>
+
+2. 创建顶点数组。他包含一个中心带洞（逆时针方向另四个顶点）四边形（顺时针方向的四个顶点）。所以在本节中我们实际上来创建一个凹多边形：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(8);
+    (*vertices)[0].set( 0.0f, 0.0f, 0.0f );
+    (*vertices)[1].set( 3.0f, 0.0f, 0.0f );
+    (*vertices)[2].set( 3.0f, 0.0f, 3.0f );
+    (*vertices)[3].set( 0.0f, 0.0f, 3.0f );
+    (*vertices)[4].set( 1.0f, 0.0f, 1.0f );
+    (*vertices)[5].set( 2.0f, 0.0f, 1.0f );
+    (*vertices)[6].set( 2.0f, 0.0f, 2.0f );
+    (*vertices)[7].set( 1.0f, 0.0f, 2.0f );
+
+3. 为所有的法线指定相同的值：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> normals = new osg::Vec3Array(1);
+    (*normals)[0].set( 0.0f,-1.0f, 0.0f );
+
+4. 构建几何体对象。在这里我们只添加两个基元集合来分别描述四边形与洞。无需多边形嵌套处理，他们将会被看作两个重叠的多边形，从而得到一个丑陋的渲染效果：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geometry> polygon = new osg::Geometry;
+    polygon->setVertexArray( vertices.get() );
+    polygon->setNormalArray( normals.get() );
+    polygon->setNormalBinding( osg::Geometry::BIND_OVERALL );
+    polygon->addPrimitiveSet( new osg::DrawArrays(
+      GL_QUADS, 0, 4) );
+    polygon->addPrimitiveSet( new osg::DrawArrays(
+      GL_QUADS, 4, 4) );
+
+5. 启动嵌套处理，将带有洞的多边形细化为凹多边形：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgUtil::Tessellator tessellator;
+    tessellator.setTessellationType( osgUtil::Tessellator::TESS_TYPE_
+    GEOMETRY );
+    tessellator.setWindingType(
+      osgUtil::Tessellator::TESS_WINDING_ODD );
+    tessellator.retessellatePolygons( *polygon );
+
+6. 现在是创建边界线的时候了。正如我们所知道的，多边形中间有个洞，所以应有两个连接线集合来表示外边界与洞。我们将会直接使用相同的顶点数组，并且为边界对象指定不同的全局颜色与线宽度参数：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array(1);
+    (*colors)[0].set( 1.0f, 1.0f, 0.0f, 1.0f );
+    osg::ref_ptr<osg::Geometry> border = new osg::Geometry;
+    border->setVertexArray( vertices.get() );
+    border->setColorArray( colors.get() );
+    border->setColorBinding( osg::Geometry::BIND_OVERALL );
+    border->addPrimitiveSet( new osg::DrawArrays(
+      GL_LINE_LOOP, 0, 4) );
+    border->addPrimitiveSet( new osg::DrawArrays(
+      GL_LINE_LOOP, 4, 4) );
+    border->getOrCreateStateSet()->setAttribute(
+      new osg::LineWidth(5.0f) );
+
+7. 将两个几何体添加到场景图并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( polygon.get() );
+    geode->addDrawable( border.get() );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+8. 现在多边形的显示很完美，并带有一个清楚的边界线表示，如下面的截图所示。我们也许会尝试一些其他复杂的多边形（特别是一些凹多边形）并确认是否可以使用类似的方式进行处理。
+
+.. figure:: _images/osgcookbook_3.1.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+我们会发现顶点数组为两个不同的几何体所共享。这为我们提供了节省CPU与GPU上内存的好处。OSG使得多个几何体共享同一个顶点缓冲区对象（VBO）足够灵活并借助于osg::PrimitiveSet的子类使用不同的子集合。要注意的是，在本节中我们还没有打开osg::Geometry类的VBO属性，而是使用传统的显示列表用于渲染。带有VBO支持的动态几何体示例将会在本章的稍后部分介绍。
+
+同时要注意嵌套器的setTessellationType()方法。TESS\_TYPE\_GEOMETRY意味着将添加的所有内容嵌套为基元集合，包括三角形，四边形与多边形。如果我们仅是处理GL\_POLYGON面，则考虑使用TESS\_TYPE\_POLYGON，在后一种情况下已有的四边形与三角形将会被保留。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+osgUtil::Tessellator类在内部使用OpenGL嵌套算法。参看"OpenGL Programming
+Guide"与"OpenGL Architecture Review Board"以了解详细内容。
+
+Extruding a 2D shape to 3D
+--------------------------
+
+挤压（Extrusion）是在如3DSMax与Maya这样的3D模型软件中快速创建3D对象的常见功能。挤压经常被用于沿着具有特定方向与长度的线拖拽2D形状由2D形状与曲线创建模型。例如，如果沿着垂直于圆面的直线进行扩展就可以将一个圆转变为圆柱体。
+
+OSG并没有直接支持这样的扩展。所以这是我们在本节中要将要实现的。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osgUtil/SmoothingVisitor>
+    #include <osgUtil/Tessellator>
+    #include <osgViewer/Viewer>
+
+2. 扩展函数至少需要三个参数－包含构成2D形状所有顶点的数组；扩展方向；以及扩展长度：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* createExtrusion( osg::Vec3Array* vertices,
+      const osg::Vec3& direction, float length )
+    {
+      ...
+    }
+
+3. 首先，我们计算所得到的3D模型的所有点，包括2D形状的原点，以及在特定的方向上使用特定的长度值扩展后的新点。我们会注意到在这里使用反转迭代器计算新顶点。这实际上有助于构建扩展几何体底面的法线向量，如下面的代码块所示：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> newVertices = new osg::Vec3Array;
+    newVertices->insert( newVertices->begin(), vertices->begin(),
+      vertices->end() );
+    unsigned int numVertices = vertices->size();
+    osg::Vec3 offset = direction * length;
+    for ( osg::Vec3Array::reverse_iterator ritr=
+      vertices->rbegin(); ritr!=vertices->rend(); ++ritr )
+    {
+      newVertices->push_back( (*ritr) + offset );
+    }
+
+4. 添加两个基元集合来表示顶面与底面。对于OpenGL而言扩展GL\_POLYGON基元并不合适，所以我们一次将其嵌入。注意，在这里使用TESS\_TYPE\_POLYGON而不是TESS\_TYPE\_GEOMETRY，后者是在前一节中使用的：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geometry> extrusion = new osg::Geometry;
+    extrusion->setVertexArray( newVertices.get() );
+    extrusion->addPrimitiveSet( new osg::DrawArrays(GL_POLYGON,
+      0, numVertices) );
+    extrusion->addPrimitiveSet( new osg::DrawArrays(GL_POLYGON,
+      numVertices, numVertices) );
+    osgUtil::Tessellator tessellator;
+    tessellator.setTessellationType(
+      osgUtil::Tessellator::TESS_TYPE_POLYGONS );
+    tessellator.setWindingType(
+      osgUtil::Tessellator::TESS_WINDING_ODD );
+    tessellator.retessellatePolygons( *extrusion );
+
+5. 嵌入有时会添加或是移除几何体的基元集合。所以如果我们要添加某些其他的基元，例如侧面，我们最好是在处理完顶面与底面之后进行处理。在这里我们只是简单的构建一个共享边界的四边形的连接集合（具有相同的第一条与最后一条边来构成一个循环）来构建面：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::DrawElementsUInt> sideIndices =
+      new osg::DrawElementsUInt( GL_QUAD_STRIP );
+    for ( unsigned int i=0; i<numVertices; ++i )
+    {
+      sideIndices->push_back( i );
+      sideIndices->push_back( (numVertices-1-i) + numVertices );
+    }
+    sideIndices->push_back( 0 );
+    sideIndices->push_back( numVertices*2 - 1 );
+    extrusion->addPrimitiveSet( sideIndices.get() );
+
+6. 最后计算法线并返回所得的几何体：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgUtil::SmoothingVisitor::smooth( *extrusion );
+    return extrusion.release();
+
+7. 在主体部分，我们为用户提供一些权利来定义其自己的扩展方向与长度值：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ArgumentParser arguments( &argc, argv );
+    osg::Vec3 direction(0.0f, 0.0f, -1.0f);
+    arguments.read( "--direction", direction.x(), direction.y(),
+      direction.z() );
+    float length = 5.0f;
+    arguments.read( "--length", length );
+
+8. 创建一个用于生成3D模型的2D点列表。事实上，这里的3D路径也同样会起作用：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(6);
+    (*vertices)[0].set( 0.0f, 4.0f, 0.0f );
+    (*vertices)[1].set(-2.0f, 5.0f, 0.0f );
+    (*vertices)[2].set(-5.0f, 0.0f, 0.0f );
+    (*vertices)[3].set( 0.0f,-1.0f, 0.0f );
+    (*vertices)[4].set( 5.0f, 0.0f, 0.0f );
+    (*vertices)[5].set( 2.0f, 5.0f, 0.0f );
+
+9. 将扩展添加到场景图并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( createExtrusion(vertices.get(), direction,
+      length) );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+10. 完成！现在我们可以说扩展是如此简单，不是吗？但实际上我们会发现由可扩展的2D形状生成了大量的对象，例如管道，柱子，甚至是矩形构建。现在，为什么不自己试着构建一个或是多个模型呢？
+
+.. figure:: _images/osgcookbook_3.2.png
+   :alt: image
+
+   image
+
+There's more...
+~~~~~~~~~~~~~~~
+
+另一个良好有用的模型方法被称为旋转（或3DSMAX中的车床，一种工业机械的名字）。他会沿特定的轴旋转2D曲线（开放或关闭的）来创建3D对象，例如酒杯与柱子。其关键参数是参考轴与旋转角度。所以，以本节为参考自己将其实现怎样呢？
+
+Drawing a NURBS surface
+-----------------------
+
+NURBS(Non-Uniform Rational
+B-Splines)是用于创建复杂曲线与面的强大方法。他仅需要很少的控制点与连接向量，而不需要表面上成百的采样点。这意味着我们可以使用B-Splines或是NURBS在数学上描述曲线或面，而不是使用小的线段或三角形近似。这听起来对于希望以一种更为精确的方法描述其模型的开发者非常合适。
+
+OpenGL提供了计算器与NURBS接口用于渲染这些参数化模型，但出于性能与实用性的考虑OSG并没有提供。在图形硬件上渲染NURBS曲线与面总是比使用近似多边形（LOD甚至更好）耗费更多的资源。但是这并不能阻止我们自己实现一个。在本节中，我们将会由osg::Drawable类派生并执行OpenGL命令在场景图的渲染遍历中绘制NURBS面。
+
+在下面的连接处可以找到关于NURBS的基本知识：
+
+http://en.wikipedia.org/wiki/Non-uniform_rational_B-spline
+
+Getting ready
+~~~~~~~~~~~~~
+
+我们需要修改在第1章的最后一节所创建的CMakeLists.txt来在编译与运行示例前查找OpenGL与GLU包：
+
+::
+
+    FIND_PACKAGE(OpenGL)
+    INCLUDE_DIRECTORIES(${OPENGL_INCLUDE_DIR})
+    TARGET_LINK_LIBRARIES(${EXAMPLE_NAME}
+      ${OPENGL_gl_LIBRARY} ${OPENGL_glu_LIBRARY})
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 在本示例中我们将会设计一个尽可能完整的NURBS面。OpenGL提供一些足够好的NURBS实现供我们这里使用。而对其进行封装的最好方法就是由osg::Drawable类派生：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class NurbsSurface : public osg::Drawable
+    {
+    public:
+      NurbsSurface()
+      : _sCount(0), _tCount(0), _sOrder(0), _tOrder(0),
+        _nurbsObj(0) {}
+      NurbsSurface( const NurbsSurface& copy,
+        osg::CopyOp copyop=osg::CopyOp::SHALLOW_COPY );
+      META_Object( osg, NurbsSurface );
+    ...
+    };
+
+2. 三种数组类型可以应用到NurbsSurface类：控制点（顶点）数组，法线数组以及用于纹理映射的纹理坐标数组。对于NURBS面，我们同时需要设置非减的连接值，以及连接数与参数化的U以及V方向的顺序。所有这些需求将会被添加作为这里的成员方法：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    void setVertexArray( osg::Vec3Array* va ) { _vertices = va; }
+    void setNormalArray( osg::Vec3Array* na ) { _normals = na; }
+    void setTexCoordArray( osg::Vec2Array* ta ) {
+      _texcoords = ta; }
+    void setKnots( osg::FloatArray* sknots,
+      osg::FloatArray* tknots )
+    { _sKnots = sknots; _tKnots = tknots; }
+    void setCounts( int s, int t ) { _sCount = s; _tCount = t; }
+    void setOrders( int s, int t ) { _sOrder = s; _tOrder = t; }
+
+3. 要重新实现的两个最重要的方法是computeBound()与drawImplementation()。如果缺少其中的任何一个，我们最终就会得到一个不正确的渲染结果：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    virtual osg::BoundingBox computeBound() const;
+    virtual void drawImplementation( osg::RenderInfo&
+      renderInfo ) const;
+
+4. 定义受保护的成员：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    virtual ~NurbsSurface() {}
+    osg::ref_ptr<osg::Vec3Array> _vertices;
+    osg::ref_ptr<osg::Vec3Array> _normals;
+    osg::ref_ptr<osg::Vec2Array> _texcoords;
+    osg::ref_ptr<osg::FloatArray> _sKnots;
+    osg::ref_ptr<osg::FloatArray> _tKnots;
+    int _sCount, _tCount;
+    int _sOrder, _tOrder;
+    mutable void* _nurbsObj;
+
+5. 在我们真正实现每一个类方法之前我们需要OpenGL与GLU头文件。而下面是有助于完成对象阴影或深度拷贝的拷贝构造函数：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/GL>
+    #include <GL/glu.h>
+    NurbsSurface::NurbsSurface( const NurbsSurface& copy,
+      osg::CopyOp copyop )
+    :  osg::Drawable(copy, copyop), _vertices(copy._vertices),
+        _normals(copy._normals), _texcoords(copy._texcoords),
+        _sKnots(copy._sKnots), _tKnots(copy._tKnots),
+        _sOrder(copy._sOrder), _tOrder(copy._tOrder),
+        _nurbsObj(copy._nurbsObj)
+    {}
+
+6. computeBound()应为场景裁剪处理进行重新实现，在其中如果NURBS面超出了视图截面，则NURBS面会被忽略。在这里仅计算控制点就足够了：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::BoundingBox NurbsSurface::computeBound() const
+    {
+      osg::BoundingBox bb;
+      if ( _vertices.valid() )
+      {
+        for ( unsigned int i=0; i<_vertices->size(); ++i )
+        bb.expandBy( (*_vertices)[i] );
+      }
+      return bb;
+    }
+
+7. drawImplementation()仅会被调用一次来构建显示列表以用于后续使用，除非默认机制被禁用。将其保留是可以的，因为这里我们并不需要NURBS动态变化：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    void NurbsSurface::drawImplementation( osg::RenderInfo&
+      renderInfo ) const
+    {
+      ...
+    }
+
+8. 在实现函数中，如果还没有分配OpenGL NURBS对象，则我们进行创建：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    GLUnurbsObj* theNurbs = (GLUnurbsObj*)_nurbsObj;
+    if ( !theNurbs )
+    {
+      theNurbs = gluNewNurbsRenderer();
+      gluNurbsProperty( theNurbs, GLU_SAMPLING_TOLERANCE, 10 );
+      gluNurbsProperty( theNurbs, GLU_DISPLAY_MODE, GLU_FILL );
+      _nurbsObj = theNurbs;
+    }
+
+9. 执行正确的OpenGL调用来完成整个NURBS绘制过程。在下面的代码段中并没有什么特殊的内容。唯一的一点是要注意OpenGL状态的变化，这会影响到复杂程序中的其他可绘制元素：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    if ( _vertices.valid() && _sKnots.valid() && _tKnots.valid() )
+    {
+      glEnable( GL_MAP2_NORMAL );
+      glEnable( GL_MAP2_TEXTURE_COORD_2 );
+      gluBeginCurve( theNurbs );
+      if ( _texcoords.valid() )
+      {
+        gluNurbsSurface( theNurbs, _sKnots->size(),
+          &((*_sKnots)[0]), _tKnots->size(), &((*_tKnots)[0]),
+          _sCount*2, 2, &((*_texcoords)[0][0]), _sOrder, _tOrder,
+          GL_MAP2_TEXTURE_COORD_2 );
+      }
+      if ( _normals.valid() )
+      {
+        gluNurbsSurface( theNurbs, _sKnots->size(),
+          &((*_sKnots)[0]), _tKnots->size(), &((*_tKnots)[0]),
+          _sCount*3, 3, &((*_normals)[0][0]), _sOrder, _tOrder,
+          GL_MAP2_NORMAL );
+      }
+      gluNurbsSurface( theNurbs, _sKnots->size(),
+        &((*_sKnots)[0]), _tKnots->size(), &((*_tKnots)[0]),
+        _sCount*3, 3, &((*_vertices)[0][0]), _sOrder, _tOrder,
+        GL_MAP2_VERTEX_3 );
+      gluEndCurve( theNurbs );
+      glDisable( GL_MAP2_NORMAL );
+      glDisable( GL_MAP2_TEXTURE_COORD_2 );
+    }
+
+10. 现在我们将会利用新的NURBS类来显示一个较小的面。首先，我们包含其他必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geode>
+    #include <osg/Texture2D>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+11. 在主体部分，我们通过指定其控制点，纹理坐标与连接创建一个普通的NURBS面：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> ctrlPoints = new osg::Vec3Array;
+    #define ADD_POINT(x, y, z) ctrlPoints->push_back(
+      osg::Vec3(x, y, z) );
+    ADD_POINT(-3.0f, 0.5f, 0.0f); ADD_POINT(-1.0f, 1.5f, 0.0f);
+      ADD_POINT(-2.0f, 2.0f, 0.0f);
+    ADD_POINT(-3.0f, 0.5f,-1.0f); ADD_POINT(-1.0f, 1.5f,-1.0f);
+      ADD_POINT(-2.0f, 2.0f,-1.0f);
+    ADD_POINT(-3.0f, 0.5f,-2.0f); ADD_POINT(-1.0f, 1.5f,-2.0f);
+      ADD_POINT(-2.0f, 2.0f,-2.0f);
+    osg::ref_ptr<osg::Vec2Array> texcoords = new osg::Vec2Array;
+    #define ADD_TEXCOORD(x, y) texcoords->push_back(
+      osg::Vec2(x, y) );
+    ADD_TEXCOORD(0.0f, 0.0f); ADD_TEXCOORD(0.5f, 0.0f);
+      ADD_TEXCOORD(1.0f, 0.0f);
+    ADD_TEXCOORD(0.0f, 0.5f); ADD_TEXCOORD(0.5f, 0.5f);
+      ADD_TEXCOORD(1.0f, 0.5f);
+    ADD_TEXCOORD(0.0f, 1.0f); ADD_TEXCOORD(0.5f, 1.0f);
+      ADD_TEXCOORD(1.0f, 1.0f);
+    osg::ref_ptr<osg::FloatArray> knots = new osg::FloatArray;
+    knots->push_back(0.0f); knots->push_back(0.0f);
+      knots->push_back(0.0f);
+    knots->push_back(1.0f); knots->push_back(1.0f);
+      knots->push_back(1.0f);
+
+12. 分配一个NurbsSurface可绘制元素，并将之前我们所设置的所有变量应用到新创建的对象：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<NurbsSurface> nurbs = new NurbsSurface;
+    nurbs->setVertexArray( ctrlPoints.get() );
+    nurbs->setTexCoordArray( texcoords.get() );
+    nurbs->setKnots( knots.get(), knots.get() );
+    nurbs->setCounts( 3, 3 );
+    nurbs->setOrders( 3, 3 );
+
+13. 我们已几乎完成！现在将纹理应用到节点或可绘制元素的状态集合，并关闭灯光来获得一个更好的观感。最后，启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( nurbs.get() );
+    geode->getOrCreateStateSet()->setTextureAttributeAndModes(
+      0, new osg::Texture2D(osgDB::readImageFile(
+        "Images/osg256.png")) );
+    geode->getOrCreateStateSet()->setMode( GL_LIGHTING,
+      osg::StateAttribute::OFF );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+14. 一个简单的NURBS面最终出现。要使其更为复杂与精炼，我们可以沿U与V方向添加更多的控制点并同时更新连接信息。然后将计算与渲染工作留给OpenGL，并在渲染窗口中享受我们的成就。
+
+.. figure:: _images/osgcookbook_3.3.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+现在我们获得了如何创建一个复杂的，自定义可绘制元素的经验。要重新实现的最重要的方法是drawImplementation()与computeBound()；而且我们需要考虑构建显示列表的默认特性是否应被禁止。如果我们需要在每一帧中调用drawImplementation()方法来执行特定用户命令，然后在模拟循环开始之前调用setUseDisplayList(false)；否则，我们可以将其保留来改善程序性能。
+
+其他要重新实现的有用方法是supports()与accept()方法及其重载形式。这些方法主要为OSG算符，例如osg::TriangleFunctor<>，使用来收集顶点与基本信息。如果没有该实现，算符不能由用户绘制元素接收任何内容，而相交器则会在其上返回一个空结果，因为缺少用于计算的数据。幸运的是，在该示例中并没有关系。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+还有一个可以分析与渲染B-Splines与NURBS对象的第三方库。一个很好的例子就是openNURNS库：
+
+http://www.opennurbs.org/
+
+OSG本身也提供了一个简单的示例来显示如何集成Bezier面。查看官方OSG源码中的osgteapot示例可以了解详细内容。
+
+Drawing a dynamic clock on the screen
+-------------------------------------
+
+现在我们将会面对一个实际的用户需求：设计一个非常简单的时钟并使其工作。这种最常见的钟使用数字表盘与运动的指针来指示时间。他通常包含一个时针，一个分针（更长更快）以及一个秒针（最长最快）。其间隔分别为12小时，60分钟与60秒。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/AnimationPath>
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/MatrixTransform>
+    #include <osgViewer/Viewer>
+
+2. 设计一个生成指针的函数。我们必须同时为每一个指针设置初始角度与间隔（旋转一周所需要的时间）：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Node* createNeedle( float w, float h, float depth,
+      const osg::Vec4& color, float angle, double period )
+    {
+      ...
+    }
+
+3. 指针形状的设计如下图所示。他很简单，但是足够表示一个真正的时钟。
+
+.. figure:: _images/osgcookbook_3.4.png
+   :alt: image
+
+   image
+
+4. 现在构建指针的几何体并将其添加到osg::Geode节点中：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(5);
+    (*vertices)[0].set(-h*0.5f, 0.0f,-w*0.1f );
+    (*vertices)[1].set( h*0.5f, 0.0f,-w*0.1f );
+    (*vertices)[2].set(-h*0.5f, 0.0f, w*0.8f );
+    (*vertices)[3].set( h*0.5f, 0.0f, w*0.8f );
+    (*vertices)[4].set( 0.0f, 0.0f, w*0.9f );
+    osg::ref_ptr<osg::Vec3Array> normals = new osg::Vec3Array(1);
+    (*normals)[0].set( 0.0f,-1.0f, 0.0f );
+    osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array(1);
+    (*colors)[0] = color;
+    osg::ref_ptr<osg::Geometry> geom = new osg::Geometry;
+    geom->setVertexArray( vertices.get() );
+    geom->setNormalArray( normals.get() );
+    geom->setNormalBinding( osg::Geometry::BIND_OVERALL );
+    geom->setColorArray( colors.get() );
+    geom->setColorBinding( osg::Geometry::BIND_OVERALL );
+    geom->addPrimitiveSet( new osg::DrawArrays(
+      GL_TRIANGLE_STRIP, 0, 5) );
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( geom.get() );
+
+5. 接下来的任务是按一定的时间间隔沿表面旋转指针。在这里使用动画路径回调来模拟圆周运动，其包含三个关键帧（圆上的三个重要点）：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::MatrixTransform> trans =
+      new osg::MatrixTransform;
+    trans->addChild( geode.get() );
+    osg::ref_ptr<osg::AnimationPath> clockPath =
+      new osg::AnimationPath;
+    clockPath->setLoopMode( osg::AnimationPath::LOOP );
+    clockPath->insert( 0.0, osg::AnimationPath::ControlPoint(
+      osg::Vec3(0.0f, depth, 0.0f), osg::Quat(angle, osg::Y_AXIS)) );
+    clockPath->insert( period*0.5, osg::AnimationPath::ControlPoint(
+      osg::Vec3(0.0f, depth, 0.0f), osg::Quat(angle+osg::PI,
+        osg::Y_AXIS)) );
+    clockPath->insert( period, osg::AnimationPath::ControlPoint(
+      osg::Vec3(0.0f, depth, 0.0f), osg::Quat(angle+osg::PI*2.0f,
+         osg::Y_AXIS)) );
+    osg::ref_ptr<osg::AnimationPathCallback> apcb =
+      new osg::AnimationPathCallback;
+    apcb->setAnimationPath( clockPath.get() );
+    trans->addUpdateCallback( apcb.get() );
+    return trans.release();
+
+6. 设计时钟盘面。作为一个练习，在本节中我们不会绘制一个真正的时钟盘面。相反，我们会拥有一个在其上没有文本或纹理的盘。所以整个绘制过程很容易理解：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Node* createFace( float radius )
+    {
+      osg::ref_ptr<osg::Vec3Array> vertices =
+        new osg::Vec3Array(67);
+      (*vertices)[0].set( 0.0f, 0.0f, 0.0f );
+      for ( unsigned int i=1; i<=65; ++i )
+      {
+        float angle = (float)(i-1) * osg::PI / 32.0f;
+        (*vertices)[i].set( radius * cosf(angle), 0.0f,
+          radius * sinf(angle) );
+      }
+      osg::ref_ptr<osg::Vec3Array> normals = new osg::Vec3Array(1);
+      (*normals)[0].set( 0.0f,-1.0f, 0.0f );
+      osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array(1);
+      (*colors)[0].set( 1.0f, 1.0f, 1.0f, 1.0f );
+      // Avoid color state inheriting
+      osg::ref_ptr<osg::Geometry> geom = new osg::Geometry;
+      geom->setVertexArray( vertices.get() );
+      geom->setNormalArray( normals.get() );
+      geom->setNormalBinding( osg::Geometry::BIND_OVERALL );
+      geom->setColorArray( colors.get() );
+      geom->setColorBinding( osg::Geometry::BIND_OVERALL );
+      geom->addPrimitiveSet( new osg::DrawArrays(
+        GL_TRIANGLE_FAN, 0, 67) );
+      osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+      geode->addDrawable( geom.get() );
+      return geode.release();
+    }
+
+7. 在主体部分，我们首先定义一个想定时间10：30。然后我们依次创建时针（最短的），分针以及秒针（最长的）。在他们与时钟表面之间有一个很小的距离，从而不会有也许会导致Z冲突问题的重叠面：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    float hour_time = 10.0f, min_time = 30.0f, sec_time = 0.0f;
+    // Hour needle devides the circle into 12 parts
+    osg::Node* hour = createNeedle(6.0f, 1.0f,-0.02f,
+      osg::Vec4(1.0f, 0.0f, 0.0f, 1.0f), osg::PI * hour_time /
+        6.0f, 3600*60.0);
+    // Minute/second needle devides the circle into 60 partsosg::Node* 
+    minute = createNeedle(8.0f, 0.6f,-0.04f,
+      osg::Vec4(0.0f, 1.0f, 0.0f, 1.0f), osg::PI * min_time /
+        30.0f, 3600.0);
+    osg::Node* second = createNeedle(10.0f, 0.2f,-0.06f,
+      osg::Vec4(1.0f, 1.0f, 0.0f, 1.0f), osg::PI * sec_time /
+        30.0f, 60.0);
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( hour );
+    root->addChild( minute );
+    root->addChild( second );
+    root->addChild( createFace(10.0f) );
+    Start the viewer to see our clock running:
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+8. 所得到的结果如下图所示：
+
+.. figure:: _images/osgcookbook_3.5.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+也许我们已经忽略了createFace()函数中的一个事实：我们向时钟表面几何体添加了一个只一个颜色的“无用”颜色数组。但是如果我们移除该函数中的setColorArray()行会发生什么呢？尝试一下而我们会看到下面的截图：
+
+.. figure:: _images/osgcookbook_3.6.png
+   :alt: image
+
+   image
+
+从而为什么盘面继续了指针的颜色呢？这是OSG程序的bug吗？事实上，由于著名的OpenGL状态机，这很难解释。所以没有设置颜色的几何会直接继承由前一个几何体发送到OpenGL管线的值，从而导致不可预期的结果。最好的解决方案是为所有的几何体对象应用颜色数组，而无论其是否需要。
+
+Drawing a ribbon following a model
+----------------------------------
+
+痕迹带可以看作是飞机或直升机后的彩带。他可以用来表示由飞机所拖拽的横幅或彩旗，或是在军事模拟中表示飞行路径。彩带绝不是一个简单的四边形。其点位于飞行线上，并且他们始终位于运动的飞机之后。所有这些需求需要一个动态几何体，其中所有的顶点都在运动。
+
+通过上一段所提供的信息，现在我们可以开始处理这一有趣的主题。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/AnimationPath>
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/MatrixTransform>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+2. 定义一些全局变量。当然，我们可以定义一个特殊的彩带类，并将其定义为成员变量，但是本节中，我们仅是简化工作：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    const unsigned int g_numPoints = 400;
+    const float g_halfWidth = 4.0f;
+    The first step is to initialize the ribbon geometry:
+    osg::Geometry* createRibbon( const osg::Vec3& colorRGB )
+    {
+      ...
+    }
+
+3. 配置顶点，法线与颜色数组。初始时，所有顶点与原点放置在一起，但是稍后他们会被看作彩带的两个边。颜色通过一个正弦函数进行计算来实现彩带移动时的淡入与淡出效果：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> vertices =
+      new osg::Vec3Array(g_numPoints);
+    osg::ref_ptr<osg::Vec3Array> normals =
+      new osg::Vec3Array(g_numPoints);
+    osg::ref_ptr<osg::Vec4Array> colors =
+      new osg::Vec4Array(g_numPoints);
+    osg::Vec3 origin = osg::Vec3(0.0f, 0.0f, 0.0f);
+    osg::Vec3 normal = osg::Vec3(0.0f, 0.0f, 1.0f);
+    for ( unsigned int i=0; i<g_numPoints-1; i+=2 )
+    {
+      (*vertices)[i] = origin; (*vertices)[i+1] = origin;
+      (*normals)[i] = normal; (*normals)[i+1] = normal;
+      float alpha = sinf(osg::PI * (float)i / (float)g_numPoints);
+      (*colors)[i] = osg::Vec4(colorRGB, alpha);
+      (*colors)[i+1] = osg::Vec4(colorRGB, alpha);
+    }
+
+4. 创建动态几何体对象。"动态"在这里意味着彩带几何体将会在模拟过程中始终变化其点与基元。在这种情况下，我们选择使用顶点缓冲区对象而不是显示列表：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geometry> geom = new osg::Geometry;
+    geom->setDataVariance( osg::Object::DYNAMIC );
+    geom->setUseDisplayList( false );
+    geom->setUseVertexBufferObjects( true );
+    Set up other options and return at the end of the createRibbon() 
+    function:
+    geom->setVertexArray( vertices.get() );
+    geom->setNormalArray( normals.get() );
+    geom->setNormalBinding( osg::Geometry::BIND_PER_VERTEX );
+    geom->setColorArray( colors.get() );
+    geom->setColorBinding( osg::Geometry::BIND_PER_VERTEX );
+    geom->addPrimitiveSet( new osg::DrawArrays(
+      GL_QUAD_STRIP, 0, g_numPoints) );
+    return geom.release();
+
+5. 第二步是当移动模型时使得彩带运动起来，并实现痕迹效果。TrailerCallback必须被添加到osg::MatrixTransform节点作为更新回调来在运行时读取并使用其变换矩阵：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class TrailerCallback : public osg::NodeCallback
+    {
+    public:
+      TrailerCallback( osg::Geometry* ribbon ) :
+        _ribbon(ribbon) {}
+      virtual void operator()( osg::Node* node,
+        osg::NodeVisitor* nv );
+    protected:
+      osg::observer_ptr<osg::Geometry> _ribbon;
+    };
+    In the operator() method, obtain necessary values and be ready to 
+    edit the vertices and normals:
+    osg::MatrixTransform* trans =
+      static_cast<osg::MatrixTransform*>(node);
+    if ( trans && _ribbon.valid() )
+    {
+      osg::Matrix matrix = trans->getMatrix();
+      osg::Vec3Array* vertices = static_cast<osg::Vec3Array*>(
+        _ribbon->getVertexArray() );
+      osg::Vec3Array* normals = static_cast<osg::Vec3Array*>(
+        _ribbon->getNormalArray() );
+      ...
+    }
+    traverse( node, nv );
+
+6. 计算彩带点的新位置与法线。修改数组来提醒缓冲区对象更新图像存。为了场景裁剪处理的目的，不要忘记使用dirtyBound()重新计算边界框：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    for ( unsigned int i=0; i<g_numPoints-3; i+=2 )
+    {
+      (*vertices)[i] = (*vertices)[i+2];
+      (*vertices)[i+1] = (*vertices)[i+3];
+      (*normals)[i] = (*normals)[i+2];
+      (*normals)[i+1] = (*normals)[i+3];
+    }
+    (*vertices)[g_numPoints-2] = osg::Vec3(0.0f,-g_halfWidth,
+      0.0f) * matrix;
+    (*vertices)[g_numPoints-1] = osg::Vec3(0.0f, g_halfWidth,
+      0.0f) * matrix;
+    vertices->dirty();
+    osg::Vec3 normal = osg::Vec3(0.0f, 0.0f, 1.0f) * matrix;
+    normal.normalize();
+    (*normals)[g_numPoints-2] = normal;
+    (*normals)[g_numPoints-1] = normal;
+    normals->dirty();
+    _ribbon->dirtyBound();
+
+7. 现在在主体部分，创建一个彩带节点并在必需时使其透明：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* geometry = createRibbon( osg::Vec3(1.0f, 0.0f,
+      1.0f) );
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( geometry );
+    geode->getOrCreateStateSet()->setMode( GL_LIGHTING,
+      osg::StateAttribute::OFF );
+    geode->getOrCreateStateSet()->setMode( GL_BLEND,
+      osg::StateAttribute::ON );
+    geode->getOrCreateStateSet()->setRenderingHint(
+      osg::StateSet::TRANSPARENT_BIN );
+
+8. 将Cessna模型载入到场景图中并使其保持飞行。将彩带添加到跟踪器回调与场景图中：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::MatrixTransform> cessna =
+      new osg::MatrixTransform;
+    cessna->addChild( osgDB::readNodeFile("cessna.osg.0,0,90.rot") );
+    cessna->addUpdateCallback(
+      osgCookBook::createAnimationPathCallback(50.0f, 6.0f) );
+    cessna->addUpdateCallback( new TrailerCallback(geometry) );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    root->addChild( cessna.get() );
+    Start the viewer:
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+9. 所得的结果看起来非常不错，尽管我们并没有使用阴影器以及其他高级技术。我们会在一些飞行模拟软件与游戏中发现类似的实现。无论是否相信，他们并不像我们以前所认为的那样困难。
+
+.. figure:: _images/osgcookbook_3.7.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+创建痕迹顶点的原则非常简单：对于每两个点（彩带的左边与右边），读取并接受数组中接下来两个点的值，依次类推。被看作彩带前端的最后两个点应连接到变换节点。他们的位置与法线将会依据当前的矩阵而更新。而在接下来的几帧中，这些值将会被传递给接下来的点，从而最终实现一个完整的痕迹效果。
+
+VBO（Vertex Buffer
+Objects）被用来表示动态几何体。在这里显示列表并不合适，因为他们并不会将顶点变化提交给OpenGL管线，除非用户销毁前一个显示列表并创建一个新的显示列表。这可以通过调用dirtyDisplayList()方法来实现，但是要比使用缓冲区对象低效得多。当处理顶点属性与索引时，VBO提供提供了一种快速的方法来连接用户程序与GPU。要通知顶点数据的变化，我们只需调用数组对象的dirty()方法。OSG将会在后端渲染中自动为我们进行更新。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+在下面的链接处可以找到关于VBO及其特性更多信息：
+
+http://www.opengl.org/wiki/Vertex_Buffer_Object
+
+Selecting and highlighting a model
+----------------------------------
+
+如果我们曾读过"OpenSceneGraph 3.0: Beginner's
+Guide"，我们也许会对该主题感到熟悉。是的，我们曾经完成过场景图中选取可绘制元素或节点并高亮显示的操作。但在该示例中，我们将会直接高亮所选取的可绘制元素，假定他是一个osg::Geometry对象（已实现相关的相交算法）并有一个颜色数组。
+
+也许我们会认为这并不是很有趣，因为在之前我们已经完成了相同的练习。但不要犹豫本节与接下来的两节。他们实际上描述了在许多3D浏览与模型软件中已存在的相同需求－选取3D实现或仅是其一部分（面，边或点）。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osgUtil/SmoothingVisitor>
+    #include <osgViewer/Viewer>
+
+2. 定义一个全局颜色变量（normalColor定义为基本颜色，而selectedColor定义为所选中的颜色）用于选中与取消选中的对象：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    const osg::Vec4 normalColor(1.0f, 1.0f, 1.0f, 1.0f);
+    const osg::Vec4 selectedColor(1.0f, 0.0f, 0.0f, 0.5f);
+
+3. 声明一个处理器类用于选取与光标相交的对象：
+
+:3. 声明一个处理器类用于选取与光标相交的对象:3.
+声明一个处理器类用于选取与光标相交的对象:
+
+::
+
+    class SelectModelHandler : public osgCookBook::PickHandler
+    {
+    public:
+      SelectModelHandler() : _lastDrawable(0) {}
+      virtual void doUserOperations(
+        osgUtil::LineSegmentIntersector::Intersection& result );
+      void setDrawableColor( osg::Geometry* geom,
+        const osg::Vec4& color );
+    protected:
+      osg::observer_ptr<osg::Geometry> _lastDrawable;
+    };
+
+4. doUserOperations()方法中的选取策略非常容易理解－取消上一个选中的，并选取一个新的。所选中的可绘制元素将会使用不同于普通对象的颜色（红色与与半透明）进行绘制：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    if ( _lastDrawable.valid() )
+    {
+      setDrawableColor( _lastDrawable.get(), normalColor );
+      _lastDrawable = NULL;
+    }
+    osg::Geometry* geom = dynamic_cast<osg::Geometry*>(
+      result.drawable.get() );
+    if ( geom )
+    {
+      setDrawableColor( geom, selectedColor );
+      _lastDrawable = geom;
+    }
+
+5. 在setDrawableColor()方法中，我们假定本节中的所有模型拥有一个仅有一个元素的颜色数组。在其他复杂的形势下，我们也许会有一个绑定到每个顶点颜色或是没有任何颜色设置的模型。考虑重写该方法以适应这样的需求：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Vec4Array* colors = dynamic_cast<osg::Vec4Array*>(
+      geom->getColorArray() );
+    if ( colors && colors->size()>0 )
+    {
+      colors->front() = color;
+      colors->dirty();
+    }
+
+6. createSimpleGeometry()方法将会创建一个带有底面与顶面的盒子，并在八个顶点上应用相同的颜色：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* createSimpleGeometry()
+    {
+      osg::ref_ptr<osg::Vec3Array> vertices =
+        new osg::Vec3Array(8);
+      (*vertices)[0].set(-0.5f,-0.5f,-0.5f);
+      (*vertices)[1].set( 0.5f,-0.5f,-0.5f);
+      (*vertices)[2].set( 0.5f, 0.5f,-0.5f);
+      (*vertices)[3].set(-0.5f, 0.5f,-0.5f);
+      (*vertices)[4].set(-0.5f,-0.5f, 0.5f);
+      (*vertices)[5].set( 0.5f,-0.5f, 0.5f);
+      (*vertices)[6].set( 0.5f, 0.5f, 0.5f);
+      (*vertices)[7].set(-0.5f, 0.5f, 0.5f);
+      osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array(1);
+      (*colors)[0] = normalColor;
+      osg::ref_ptr<osg::DrawElementsUInt> indices =
+        new osg::DrawElementsUInt(GL_QUADS, 24);
+      (*indices)[0] = 0; (*indices)[1] = 1; (*indices)[2] = 2;
+        (*indices)[3] = 3;
+      (*indices)[4] = 4; (*indices)[5] = 5; (*indices)[6] = 6;
+        (*indices)[7] = 7;
+      (*indices)[8] = 0; (*indices)[9] = 1; (*indices)[10]= 5;
+        (*indices)[11]= 4;
+      (*indices)[12]= 1; (*indices)[13]= 2; (*indices)[14]= 6;
+        (*indices)[15]= 5;
+      (*indices)[16]= 2; (*indices)[17]= 3; (*indices)[18]= 7;
+        (*indices)[19]= 6;
+      (*indices)[20]= 3; (*indices)[21]= 0; (*indices)[22]= 4;
+        (*indices)[23]= 7;
+      osg::ref_ptr<osg::Geometry> geom = new osg::Geometry;
+      geom->setDataVariance( osg::Object::DYNAMIC );
+      geom->setUseDisplayList( false );
+      geom->setUseVertexBufferObjects( true );
+      geom->setVertexArray( vertices.get() );
+      geom->setColorArray( colors.get() );
+      geom->setColorBinding( osg::Geometry::BIND_OVERALL );
+      geom->addPrimitiveSet( indices.get() );
+      osgUtil::SmoothingVisitor::smooth( *geom );
+      return geom.release();
+    }
+
+7. 在主体部分，我们创建盒子几何体并将其设置为透明：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( createSimpleGeometry() );
+    geode->getOrCreateStateSet()->setMode(
+      GL_BLEND, osg::StateAttribute::ON );
+    geode->getOrCreateStateSet()->setRenderingHint(
+      osg::StateSet::TRANSPARENT_BIN );
+    Construct the scene graph and start the viewer:
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    osgViewer::Viewer viewer;
+    viewer.addEventHandler( new SelectModelHandler );
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+8. 按下Ctrl并选中中间所显示的盒子。他将会变为红色，意味着该模型被用户所选中，如下面的截图所示：
+
+.. figure:: _images/osgcookbook_3.8.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+这里当鼠标在几何体上点击时，我们会高亮显示该几何体。SelectModelHandler对象被用来检测眼方向线与屏幕的交战。而当我们在重写的doUserOperations()方法获得任何结果时，我们获取颜色数组进行修改。VBO数据应在操作之后进行更新。
+
+除了某些先决条件，高亮显示模型很容易实现：模型必须是一个osg::Geometry对象，而且他应已经使用至一个要修改的值来设置颜色数组。模型上的材质与纹理也需要考虑，因为他们也会影响最终的像素。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+还有一些其他的方法使得模型被选中，例如在其周围放置一个边界框，在其上绘制模型丝线（参看OSG示例osgscribe以了解详细内容），或是在模型周围绘制一个轮廓（参看示例osgoutline与osgFX::Cartoon节点以了解详细内容）。
+
+Selecting a triangle face of the model
+--------------------------------------
+
+让我们继续上一节的内容。当在3D世界中编辑一个选中的模型时，我们通常有多个选择：点，边，面（三角形或四边形）与实体。编辑一个或多个模型面意味着移动、旋转、缩放、移除、扩展或是我们所希望的其他操作。在计算机图形设计领域，包含人与巨兽在内的复杂多边形可以借助于不同的面编辑器（也称之为底层多边形模型化）由简单的盒子进行创建。
+
+当然这些内容超出了本书的内容，但是我们将会探讨这些高级操作的基础，也就是，模型三角面的选取。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件并定义颜色变量：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/MatrixTransform>
+    #include <osg/PolygonOffset>
+    #include <osgUtil/SmoothingVisitor>
+    #include <osgViewer/Viewer>
+    const osg::Vec4 normalColor(1.0f, 1.0f, 1.0f, 1.0f);
+    const osg::Vec4 selectedColor(1.0f, 0.0f, 0.0f, 0.5f);
+
+2. 这次SelectModelHandler类将会管理选中的对象（通过重叠并高亮显示来表示所选中的三角面）。当我们选取模型时他被用来表示所选中的面：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class SelectModelHandler : public osgCookBook::PickHandler
+    {
+    public:
+      SelectModelHandler() : _selector(0) {}
+      osg::Geode* createFaceSelector();
+      virtual void doUserOperations(
+        osgUtil::LineSegmentIntersector::Intersection& result );
+    protected:
+      osg::ref_ptr<osg::Geometry> _selector;
+    };
+
+3. 在createFaceSelector()方法中，选择符几何体应使用用于选取三角面的三个顶点来进行分配。选择符的所有顶点被重置来原始值从而在开始时他们并不可见。当面被选中时，该几何体将会被重置来与选中的三角面重叠并高亮显示来表示他已被选中：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array(1);
+    (*colors)[0] = selectedColor;
+    _selector = new osg::Geometry;
+    _selector->setDataVariance( osg::Object::DYNAMIC );
+    _selector->setUseDisplayList( false );
+    _selector->setUseVertexBufferObjects( true );
+    _selector->setVertexArray( new osg::Vec3Array(3) );
+    _selector->setColorArray( colors.get() );
+    _selector->setColorBinding( osg::Geometry::BIND_OVERALL );
+    _selector->addPrimitiveSet( new osg::DrawArrays(
+      GL_TRIANGLES, 0, 3) );
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( _selector.get() );
+    geode->getOrCreateStateSet()->setMode(
+      GL_LIGHTING, osg::StateAttribute::OFF );
+    geode->getOrCreateStateSet()->setMode(
+      GL_BLEND, osg::StateAttribute::ON );
+    geode->getOrCreateStateSet()->setRenderingHint(
+      osg::StateSet::TRANSPARENT_BIN );
+    return geode.release();
+
+4. 在doUserOperations()方法中，当我们获得一个相交结果时，我们需要首先检测所选中的几何体及其顶点属性是否正确可用，并获取以备后续使用：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* geom = dynamic_cast<osg::Geometry*>(
+      result.drawable.get() );
+    if ( !geom || !_selector || geom==_selector ) return;
+    osg::Vec3Array* vertices = dynamic_cast<osg::Vec3Array*>(
+      geom->getVertexArray() );
+    osg::Vec3Array* selVertices = dynamic_cast<osg::Vec3Array*>(
+      _selector->getVertexArray() );
+    if ( !vertices || !selVertices ) return;
+
+5. 计算选中模型的局部到世界矩阵。这有助于我们选取选择符的正确顶点位置。正如我们所知道的，indexList变量以由近到远的顺序保存了与鼠标光标相交的所有三角面。每个三角面通过将其三个点的索引压入列表来记录。在这里我们只是简单的取出并与局部到世界矩阵进行相乘，重置选择符的点，并修改：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Matrix matrix = osg::computeLocalToWorld( result.nodePath );
+    const std::vector<unsigned int>& selIndices =
+      result.indexList;
+    for ( unsigned int i=0; i<3 && i<selIndices.size(); ++i )
+    {
+      unsigned int pos = selIndices[i];
+      (*selVertices)[i] = (*vertices)[pos] * matrix;
+    }
+    // Dirty the selector geometry to highlight the picked face
+    selVertices->dirty();
+    _selector->dirtyBound();
+
+createSimpleGeometry()与上一个并没有什么区别。
+
+6. 在主体部分，我们在简单的盒子几何体上应用的额外的osg::PolygonOffset属性进行测试。原因很清楚：所选中的面几何体将会与盒子的三角面相重叠，因为他们有相同的顶点值，但是OpenGL并不能处理这样情况，并且在渲染场景时会弄混两个面。在本示例中使用多边形偏移功能是一个合适的解决方案：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( createSimpleGeometry() );
+    geode->getOrCreateStateSet()->setAttributeAndModes(
+      new osg::PolygonOffset(1.0f, 1.0f) );
+
+7. 盒子被添加为变换节点的子节点。然而我们可以修改变换矩阵来测试我们的示例代码是否适用于放置在任意位置的模型：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::MatrixTransform> trans =
+      new osg::MatrixTransform;
+    trans->addChild( geode.get() );
+    trans->setMatrix( osg::Matrix::translate(0.0f, 0.0f, 1.0f) );
+
+8. 将所选中的几何体面以及模型节点添加到根节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<SelectModelHandler> selector =
+      new SelectModelHandler;
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( trans.get() );
+    root->addChild( selector->createFaceSelector() );
+
+9. 启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgViewer::Viewer viewer;
+    viewer.addEventHandler( selector.get() );
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+10. 按下Ctrl并点击盒子模型的任意位置。这里osg::MatrixTransform节点可以显示将顶点由局部转换为世界的重要性。试着注释掉osg::computeLocalToWorld()的使用并看一下会发生什么。
+
+.. figure:: _images/osgcookbook_3.9.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+也许我们依然在寻找修改面的颜色来高亮显示的方法。不幸的是，在OpenGL中并不能修改面颜色，因为颜色实际上是一个顶点属性。阴影器也许有助于使用不同的颜色或透明性来表示特定的面，但是在本节中似乎有些大材小用。
+
+注意面选择器节点应放置在根节点之下（世界坐标系统中）;否则，当计算其顶点时，我们必须向选择踌躇的局部坐标应用一个额外的世界坐标的变换矩阵。额外的矩阵如下面的代码块所示：
+
+::
+
+    osg::Matrix matrix = osg::computeLocalToWorld( result.nodePath );
+    osg::Matrix matrix2 = osg::computeWorldToLocal(
+      faceSelector->getParentalNodePaths()[0] );
+    for ( unsigned int i=0; i<3 && i<selIndices.size(); ++i )
+    {
+      unsigned int pos = selIndices[i];
+      (*selVertices)[i] = (*vertices)[pos] * matrix * matrix2;
+    }
+
+There's more...
+~~~~~~~~~~~~~~~
+
+经典的Z冲突问题出现在当基元是共面的，或是他们过于接近而不能区分其高亮值时。在这种情况下，我们需要使用多边形偏移来强制调整这些基元中一个或多个的深度结果。在下面的链接处可以找到更多的内容：
+
+http://www.opengl.org/resources/faq/technical/polygonoffset.htm
+
+Selecting a point on the model
+------------------------------
+
+模型选取部分的下一个任务有一些挑战：我们将要选取模型上的某一点。当编辑多边形的拓扑结构时，点与边非常有用。例如，我们可以指定一个点或边并且将共享该点的所有面折叠为一个新的点或线，而这是某些拓扑简化算法的基本步骤。但是毫无疑问，首要的工作是像前一样正确的选取点。
+
+要注意的，选取点并不像选取面一样容易。后者具有一个区域并且可以与用户定义的线段相交。但是我们如何使用线仅选取一个点呢？解决方案是：计算所有可能点与模型上的相交点的距离，如果距离足够短，我们就使得一个被选中。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件并定义颜色变量：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/MatrixTransform>
+    #include <osg/Point>
+    #include <osg/PolygonOffset>
+    #include <osgUtil/SmoothingVisitor>
+    #include <osgViewer/Viewer>
+    const osg::Vec4 normalColor(1.0f, 1.0f, 1.0f, 1.0f);
+    const osg::Vec4 selectedColor(1.0f, 0.0f, 0.0f, 1.0f);
+
+2. 这是我们第三次遇到SelectModelHandler类。在该示例中，他提供了一个仅包含一个向量的选取几何体来显示点的位置：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    class SelectModelHandler : public osgCookBook::PickHandler
+    {
+    public:
+      SelectModelHandler( osg::Camera* camera )
+      : _selector(0), _camera(camera) {}
+      osg::Geode* createPointSelector();
+      virtual void doUserOperations(
+        osgUtil::LineSegmentIntersector::  Intersection& result );
+    protected:
+      osg::ref_ptr<osg::Geometry> _selector;
+      osg::observer_ptr<osg::Camera> _camera;
+    };
+
+3. 在createPointSelector()方法中，使用一个向量分配选择器几何体。为了使其在渲染时清晰，我们同时必须指定点尺寸属性：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array(1);
+    (*colors)[0] = selectedColor;
+    _selector = new osg::Geometry;
+    _selector->setDataVariance( osg::Object::DYNAMIC );
+    _selector->setUseDisplayList( false );
+    _selector->setUseVertexBufferObjects( true );
+    _selector->setVertexArray( new osg::Vec3Array(1) );
+    _selector->setColorArray( colors.get() );
+    _selector->setColorBinding( osg::Geometry::BIND_OVERALL );
+    _selector->addPrimitiveSet( new osg::DrawArrays(
+      GL_POINTS, 0, 1) );
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( _selector.get() );
+    geode->getOrCreateStateSet()->setAttributeAndModes(
+      new osg::Point(10.0f) );
+    geode->getOrCreateStateSet()->setMode(
+      GL_LIGHTING, osg::StateAttribute::OFF );
+    return geode.release();
+
+4. 在doUserOperations()方法中，由选取的几何体与选取中获取必须的变量：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* geom = dynamic_cast<osg::Geometry*>(
+      result.drawable.get() );
+    if ( !geom || !_selector || geom==_selector ) return;
+    osg::Vec3Array* vertices = dynamic_cast<osg::Vec3Array*>(
+      geom->getVertexArray() );
+    osg::Vec3Array* selVertices = dynamic_cast<osg::Vec3Array*>(
+      _selector->getVertexArray() );
+    if ( !vertices || !selVertices ) return;
+
+5. 计算用于将所选中的模型转换变世界坐标的世界相交点与矩阵。然后我们将会点与矩阵转换为投影坐标，在其中顶点的范围为由[-1,-1,-1]到[1,1,1]。我们会在稍后解释原因：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Vec3 point = result.getWorldIntersectPoint();
+    osg::Matrix matrix = osg::computeLocalToWorld(
+      result.nodePath );
+    osg::Matrix vpMatrix;
+    if ( _camera.valid() )
+    {
+      vpMatrix = _camera->getViewMatrix() * _camera-
+        >getProjectionMatrix();
+      point = point * vpMatrix;
+    }
+
+6. 查找最近选取三角面的所有三个顶点，并计算相交点与其中每一个点的距离。如果其中一个距离小于指定的阈值(0.1)，我们就说相应的点被选中。要注意的是，距离值与阈值是考虑投影坐标系统计算得出的：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    const std::vector<unsigned int>& selIndices =
+      result.indexList;
+    for ( unsigned int i=0; i<3 && i<selIndices.size(); ++i )
+    {
+      unsigned int pos = selIndices[i];
+      osg::Vec3 vertex = (*vertices)[pos] * matrix;
+      float distance = (vertex * vpMatrix - point).length();
+      if ( distance<0.1f )
+      {
+        selVertices->front() = vertex;
+      }
+    }
+    // Dirty the selector geometry to highlight the picked point
+    selVertices->dirty();
+    _selector->dirtyBound();
+
+当然，createSimpleGeometry()函数在三节中并没有变化。
+
+7. 在主体部分，我们将会使用多边形偏移设置创建示例模型，并将其添加到变换节点：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( createSimpleGeometry() );
+    geode->getOrCreateStateSet()->setAttributeAndModes(
+      new osg::PolygonOffset(1.0f, 1.0f) );
+    osg::ref_ptr<osg::MatrixTransform> trans =
+      new osg::MatrixTransform;
+    trans->addChild( geode.get() );
+    trans->setMatrix( osg::Matrix::translate(0.0f, 0.0f, 1.0f) );
+
+8. 创建选取处理器并将所选取的点对象添加到场景图：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osgViewer::Viewer viewer;
+    osg::ref_ptr<SelectModelHandler> selector =
+      new SelectModelHandler( viewer.getCamera() );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( trans.get() );
+    root->addChild( selector->createPointSelector() );
+    viewer.addEventHandler( selector.get() );
+    viewer.setSceneData( root.get() );
+
+9. 最后一件需要注意的是，在启动查看器之前禁止小特性裁剪（small feature
+   culling）模式，启用该模式后端渲染会自动忽略单向量的几何体：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::CullSettings::CullingMode mode =
+      viewer.getCamera()->getCullingMode();
+    viewer.getCamera()->setCullingMode( mode &
+      (~osg::CullSettings::SMALL_FEATURE_CULLING) );
+    return viewer.run();
+
+10. 按下Ctrl并点击一个近似端点（事实上我们并不能精确选中）。如果光标足够近，点就会被选中，而一个红色略大的点就会显示；否则，不会发生任何事情，因为我们的光标依然离我们的目标很远。
+
+.. figure:: _images/osgcookbook_3.10.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+在第6步中，我们使用一个略微复杂的方法来计算由选中三角面的顶点到选中点的距离。在获取距离之前，两个点均被变换为投影坐标系统：
+
+::
+
+    float distance = (vertex * vpMatrix - point).length();
+
+我们也许会有一个问题－如果我们忽略视图与投影矩阵而在世界坐标中直接计算距离可以吗？答案是肯定的，但是结果并不精确。当我们缩放相机而远离模型时，选取点将会变为一件非常困难的任务，因为我们很难将鼠标光标放在离预期的顶点足够近的位置。这是因为用于确定可选中距离的阈值是固定的，但是依据当前的相机模型的像素尺寸会不同。
+
+现在我们可以明白为什么我们在这里添加一个额外的矩阵变换了：我们将点变换为投影坐标，并将距离与阈值进行比较。社稷与投影矩阵不再是影响因素，从而使得点选取对于终端用户更为容易。
+
+该解决方案还有另一个问题：选取操作必须首先与模型相交，然而我们可以检测哪一个点最可能被选中。如果用户点击一个与点非常近的位置，但是与模型本身并不相交，则整个处理就会失败。有鉴于此，我们可以考虑由osgUtil::Intersector类派生来设计一个新相交器，我们会在本书的稍后章节进行探讨。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+这是我们第一次接触小特性裁剪或捐献裁剪（contribution
+culling）。一句话，这是一种丢弃不会对最终的渲染结果产生影响的裁剪方法。
+
+Using vertex-displacement mapping in shaders
+--------------------------------------------
+
+这是否我们第一次听说置换映射（displacement
+mapping）这个名字？不要担心。他仅是一种现代计算机图形技术。也许我们熟悉撞击映射（bump
+mapping），该技术使用特殊的纹理映射模拟bump并使得所得到的结果更为真实。是的，他与置换映射有一些类似的地方－初始时两者均具有平滑的表面；两者均利用阴影器用于特殊效果；而两者均像参数查找表那样由纹理读取数据。
+
+顶点置换映射，正如其名字所暗示的，使用纹理来修改顶点位置与法线而不是像素。他生成动态的，详细而真实的骨骼数据，而不是假想的（bump
+mappking替换假想结果）。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/Texture2D>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+2. 顶点映射的核心特征是使用纹理值来修改顶点位置。有时这会由一个或多个纹理生成粗糙的表面。在我们的顶点阴影器，这是通过应用一个由每个顶点Z坐标（高度）上的纹理参数读取的简单值来实现的：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    const char* vertCode = {
+      "uniform sampler2D defaultTex;\n"
+      "varying float height;\n"
+      "void main()\n"
+      "{\n"
+        "vec2 uv = gl_MultiTexCoord0.xy;\n"
+        "vec4 color = texture2D(defaultTex, uv);\n"
+        "height = 0.3*color.x + 0.59*color.y + 0.11*color.z;\n"
+        "vec4 pos = gl_Vertex;\n"
+        "pos.z = pos.z + 100.0*height;\n"
+        "gl_Position = gl_ModelViewProjectionMatrix * pos;\n"
+      "}\n"
+    };
+
+3. 片段阴影器将会根据高度值来确定像素颜色。较低的区域使用较深的灰度颜色进行绘制，而高地则绘制为绿色：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    const char* fragCode = {
+      "varying float height;\n"
+      "const vec4 lowerColor = vec4(0.1, 0.1, 0.1, 1.0);\n"
+      "const vec4 higherColor = vec4(0.2, 1.0, 0.2, 1.0);\n"
+      "void main()\n"
+      "{\n"
+        "gl_FragColor = mix(lowerColor, higherColor, height);\n"
+        // height won't go beyond 1.0 in this recipe
+      "}\n"
+    };
+
+4. 创建网格几何体作为置换映射容器。实际上他是一个二维的普通网格对象，其中每一个网格单元具有唯一的(x,y)坐标。通过为这些单元设置不同的Z值，所以我们可以很容易创建3D地形：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* createGridGeometry( unsigned int column,
+      unsigned int row )
+    {
+      ...
+    }
+
+5. 创建网格点与纹理坐标。后者更为重要，因为他会被用来由纹理对象读取纹理：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> vertices =
+      new osg::Vec3Array(column * row);
+    osg::ref_ptr<osg::Vec2Array> texcoords =
+      new osg::Vec2Array(column * row);
+    for ( unsigned int i=0; i<row; ++i )
+    {
+      for ( unsigned int j=0; j<column; ++j )
+      {
+        (*vertices)[i*column + j].set( (float)i, (float)j, 0.0f );
+        (*texcoords)[i*column + j].set( (float)i/(float)row,
+          (float)j/(float)column );
+      }
+    }
+
+6. 分配几何体并组装顶点。在这里GL\_QUAD\_STRIP参数适合构建这样的网格几何体：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geometry> geom = new osg::Geometry;
+    geom->setUseDisplayList( false );
+    geom->setUseVertexBufferObjects( true );
+    geom->setVertexArray( vertices.get() );
+    geom->setTexCoordArray( 0, texcoords.get() );
+    for ( unsigned int i=0; i<row-1; ++i )
+    {
+      osg::ref_ptr<osg::DrawElementsUInt> de =
+        new osg::DrawElementsUInt(GL_QUAD_STRIP, column*2);
+      for ( unsigned int j=0; j<column; ++j )
+      {
+        (*de)[j*2 + 0] = i*column + j;
+        (*de)[j*2 + 1] = (i+1)*column + j;
+      }
+      geom->addPrimitiveSet( de.get() );
+    }
+
+7. 这里设置自定义的边界框：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    geom->setInitialBound( osg::BoundingBox(
+      -1.0f,-1.0f,-100.0f, 1.0f, 1.0f, 100.0f) );
+
+8. 设置纹理与阴影器属性。在这里我们使用LINEAR来替换常见的LINEAR\_MIPMAL\_LINEAR参数来设置纹理缩小函数。这将会禁止texture
+   mipmapping，在将纹理映射看作参数表的本节中该特性并没有用：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Texture2D> texture = new osg::Texture2D;
+    texture->setImage( osgDB::readImageFile("Images/osg256.png") );
+    texture->setFilter( osg::Texture2D::MIN_FILTER,
+      osg::Texture2D::LINEAR );
+    texture->setFilter( osg::Texture2D::MAG_FILTER,
+      osg::Texture2D::LINEAR );
+    geom->getOrCreateStateSet()->setTextureAttributeAndModes(
+      0, texture.get() );
+    geom->getOrCreateStateSet()->addUniform(
+      new osg::Uniform("defaultTex", 0) );
+    osg::ref_ptr<osg::Program> program = new osg::Program;
+    program->addShader( new osg::Shader(osg::Shader::VERTEX,
+      vertCode) );
+    program->addShader( new osg::Shader(osg::Shader::FRAGMENT,
+      fragCode) );
+    geom->getOrCreateStateSet()->setAttributeAndModes(
+      program.get() );
+    return geom.release();
+
+9. 在主体部分，并没有太多需要做的。我们仅是将网格几何体添加到场景并开始渲染：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( createGridGeometry(512, 512) );
+    geode->getOrCreateStateSet()->setMode( GL_LIGHTING,
+      osg::StateAttribute::OFF );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+10. 我们将选取OpenSceneGraph
+    logo作为纹理。该图片的深色部分构成了低陆，而浅色部分则构成了高陆。一个真实的数字高程模型（DEM）图像也许会实现一个更好的场景，但是他一定会需要更多的顶点与较大的纹理解析。
+
+.. figure:: _images/osgcookbook_3.11.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+这里我们使用setInitialBound方法为几何体设置自定义的边界。我们可以由程序中移除该行并重新构建来看一下区别。我们将会看到下面截图所示的图片：
+
+.. figure:: _images/osgcookbook_3.12.png
+   :alt: image
+
+   image
+
+看起来有些奇怪？所生成模型的部分被裁剪并为背景所替换。原因很清楚：OSG会根据场景对象的边界自动计算投影矩阵的近端与远端，但是他不会知道我们在阴影器要完成的内容。他会参考存储在CPU内存中的顶点来计算几何体的边界框，并忽略Z方向上的位置变化。
+
+这会导致以一种错误的方法裁剪几何体的错误的近/远值。要解决此问题，我们最好自己确定特殊可绘制元素的边界。而这正是我们使用setInitialBound()方法的原因。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+要了解displacement，bump与普通映射的更多信息，可以访问下面的站点：
+
+http://en.wikipedia.org/wiki/Displacement_mapping
+
+http://en.wikipedia.org/wiki/Bump_mapping
+
+http://en.wikipedia.org/wiki/Normal_mapping
+
+osgFX库也有一个bump映射实现。如果我们感兴趣可以阅读其源码及osgfxbrowser示例。
+
+Using the draw instanced extension
+----------------------------------
+
+在现代3D程序中场景使用大量表示粒子，树或人群的小几何体进行填充是很常见的。渲染这样大量的多边形，无论他们多么简单，对于计算机图形硬件与API也是一个沉重的负担。整个操作会相当的慢，特别是当我们向图形管理提供大量的数据时。
+
+在这种情况下，硬件几何体立即化（在OpenGL被称之为draw
+instanced）将会非常重要。他会使得相同的几何对象，或是相同的顶点与基元集合被实例化多次并使用不同的变换进行渲染。他减少了OpenGL命令调用以及重复数据使用的次数，从而使得更为高效的渲染满是相同几何体的场景成为可能。当然，在这里必须使用阴影器来处理任意几何体对象的实例。
+
+How to do it...
+~~~~~~~~~~~~~~~
+
+让我们开始吧。
+
+1. 包含必须的头文件：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    #include <osg/Geometry>
+    #include <osg/Geode>
+    #include <osg/Texture2D>
+    #include <osgDB/ReadFile>
+    #include <osgViewer/Viewer>
+
+2. 顶点阴影器定义了实例对象的行为并依据一定的规则进行绘制。我们会在本节稍后解释concrete
+   program。
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    const char* vertCode = {
+      "uniform sampler2D defaultTex;\n"
+      "const float PI2 = 6.2831852;\n"
+      "void main()\n"
+      "{\n"
+      "float r = float(gl_InstanceID) / 256.0;\n"
+      "vec2 uv = vec2(fract(r), floor(r) / 256.0);\n"
+      "vec4 pos = gl_Vertex + vec4(uv.s * 384.0, 32.0 *
+        sin(uv.s * PI2), uv.t * 384.0, 1.0);\n"
+      "gl_FrontColor = texture2D(defaultTex, uv);\n"
+      "gl_Position = gl_ModelViewProjectionMatrix * pos;\n"
+      "}\n"
+    };
+
+3. 使用createInstancedGeometry()函数来创建相同几何体的多个实例：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::Geometry* createInstancedGeometry(
+      unsigned int numInstances )
+    {
+      ...
+    }
+
+4. 我们仅使用四个顶点创建一个四边形，这对于演示用法就足够了：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(4);
+    (*vertices)[0].set(-0.5f, 0.0f,-0.5f );
+    (*vertices)[1].set( 0.5f, 0.0f,-0.5f );
+    (*vertices)[2].set( 0.5f, 0.0f, 0.5f );
+    (*vertices)[3].set(-0.5f, 0.0f, 0.5f );
+    osg::ref_ptr<osg::Geometry> geom = new osg::Geometry;
+    geom->setUseDisplayList( false );
+    geom->setUseVertexBufferObjects( true );
+    geom->setVertexArray( vertices.get() );
+
+5. 使用绘制实例扩展也许比我们所认为的更为简单。无论是osg::DrawArrays还是osg::DrawElements\*类都有一个numInstances参数（至少一个参数列表）表明实例化对象的数量。设置非零值来允许绘制实例化。并且再次设置一个自定义的边界框，因为系统仅依据四个原始点无法确定实际的边界：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    geom->addPrimitiveSet( new osg::DrawArrays(
+      GL_QUADS, 0, 4, numInstances) );
+    geom->setInitialBound( osg::BoundingBox(
+      -1.0f,-32.0f,-1.0f, 192.0f, 32.0f, 192.0f) );
+
+6. 应用纹理与阴影器属性。这与上一节几乎相同：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Texture2D> texture = new osg::Texture2D;
+    texture->setImage( osgDB::readImageFile("Images/osg256.png") );
+    texture->setFilter( osg::Texture2D::MIN_FILTER,
+      osg::Texture2D::LINEAR );
+    texture->setFilter( osg::Texture2D::MAG_FILTER,
+      osg::Texture2D::LINEAR );
+    geom->getOrCreateStateSet()->setTextureAttributeAndModes(
+      0, texture.get() );
+    geom->getOrCreateStateSet()->addUniform(
+      new osg::Uniform("defaultTex", 0) );
+    osg::ref_ptr<osg::Program> program = new osg::Program;
+    program->addShader( new osg::Shader(osg::Shader::VERTEX,
+      vertCode) );
+    geom->getOrCreateStateSet()->setAttributeAndModes(
+      program.get() );
+    return geom.release();
+
+7. 好，现在我们将进入主体部分；将几何体对象添加到场景并启动查看器：
+
+.. raw:: html
+
+   <!-- -->
+
+::
+
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+    geode->addDrawable( createInstancedGeometry(256*256) );
+    osg::ref_ptr<osg::Group> root = new osg::Group;
+    root->addChild( geode.get() );
+    osgViewer::Viewer viewer;
+    viewer.setSceneData( root.get() );
+    return viewer.run();
+
+8. 我们将会看到大量的四边形出现在3D世界中，在一个正弦面上排列。这很令人惊奇，因为我们仅使用四个点创建了一个几何体，但是现在超过上千个。通过这一功能，大量的CPU内存与管线命令被节省下来。
+
+.. figure:: _images/osgcookbook_3.13.png
+   :alt: image
+
+   image
+
+How it works...
+~~~~~~~~~~~~~~~
+
+绘制实例扩展需要OpenGL
+2.0才能正常工作。他在CPU端极大的减少了顶点与基元的使用，但是依然能够像传统方法一样高效的构建几何体。他引入了一个新的只读的，内建的GLSL变量gl\_InstanceID，包含渲染管线中当前的实例ID（由0到实例数）。通过将纹理作为参数表，我们可以依据ID查找数据并设置gl\_Position，glTexCoord[\*]，以及其他的输出到合适值。这使得设置底层多边形人的位置与属性，甚至是某些科学可视化工作成为可能，例如，点云数据的绘制。
+
+gl\_Vertex变量表示为每一个实例所用的相同顶点数据，而gl\_Normal与gl\_MultiTexCoord\*变量也是如此。我们必须将变换矩阵与自定义偏移应用其上来将实例移动到3D世界中的不同位置处。
+
+在本节的阴影器代码中，pos变量表示世界坐标（通过向原始的gl\_Vertex变量添加偏移）中每一个实例多边形的位置。然后，我们将模型视图投影（MVP）矩阵与其相乘来获得投影坐标中的位置，这实际上是为渲染管线中最终的顶点组合所需要的。
+
+注意，这里的阴影器代码并不完美，因为他固定了行与列实例的数量。我们可以尝试修改来提供一个更为可扩展的绘制实例实现。
+
+There's more...
+~~~~~~~~~~~~~~~
+
+在下面的链接处可以找到关于OpenGL绘制实例支持的更多信息：
+
+http://www.opengl.org/registry/specs/ARB/draw_instanced.txt
+
+而OSG示例osgdrawinstanced也有助于研究这一有趣功能。我们可以将其看作本节的一个升级版本。
